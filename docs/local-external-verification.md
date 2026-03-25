@@ -22,6 +22,7 @@ PowerShell example:
 $env:DEPLOY_MODE = "external"
 $env:DATABASE_URL = "mysql://USER:PASSWORD@HOST:3306/gakuwari_map_external"
 $env:GEMINI_API_KEY = "..."
+$env:BRAVE_SEARCH_API_KEY = "..."
 $env:GOOGLE_MAPS_SERVER_API_KEY = "..."
 $env:VITE_GOOGLE_MAPS_BROWSER_API_KEY = "..."
 $env:GOOGLE_MAPS_BROWSER_API_KEY = "..."
@@ -97,6 +98,6 @@ After the smoke script passes, confirm the UI manually:
 
 ## Notes
 
-- `/agent` uses the direct Gemini path in `server/agent.ts`
+- `/agent` uses the direct Gemini + Brave Search path in `server/agent.ts`
 - `server/_core/llm.ts` is not used for this verification flow
 - `DEMO_MAP_ID` is acceptable for local verification only; switch to a real Map ID before production

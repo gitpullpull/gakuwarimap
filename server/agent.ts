@@ -41,14 +41,23 @@ export interface GakuwariSearchResult {
   confidence: "high" | "medium" | "low";
 }
 
-interface SearXNGResult {
+interface BraveSearchResult {
   title: string;
   url: string;
   content: string;
 }
 
-interface SearXNGResponse {
-  results: SearXNGResult[];
+interface BraveSearchApiResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  extra_snippets?: string[];
+}
+
+interface BraveSearchResponse {
+  web?: {
+    results?: BraveSearchApiResult[];
+  };
 }
 
 type AgentConfidence = AgentResultItem["confidence"];
@@ -162,7 +171,7 @@ interface RankedCandidate extends CandidateSeed {
   scout: "Scout/Ranker";
 }
 
-interface EvidenceSnippet extends SearXNGResult {
+interface EvidenceSnippet extends BraveSearchResult {
   query: string;
 }
 
@@ -186,7 +195,7 @@ interface InvestigationOutcome {
   reviewer?: "Reviewer";
 }
 
-const DEFAULT_SEARXNG_URL = "https://searxng.gitpullpull.me";
+const DEFAULT_BRAVE_SEARCH_API_URL = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview";
 const DEFAULT_GEMINI_OPENAI_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -335,8 +344,16 @@ function getMapsConfigurationError(): string {
   }
 }
 
-function getSearxngUrl(): string {
-  return process.env.SEARXNG_URL?.trim() || DEFAULT_SEARXNG_URL;
+function getBraveSearchApiUrl(): string {
+  return process.env.BRAVE_SEARCH_API_URL?.trim() || DEFAULT_BRAVE_SEARCH_API_URL;
+}
+
+function getBraveSearchApiKey(): string {
+  return (
+    process.env.BRAVE_SEARCH_API_KEY?.trim() ||
+    process.env.BRAVE_API_KEY?.trim() ||
+    ""
+  );
 }
 
 function getGeminiConfig() {
@@ -629,15 +646,42 @@ async function callGeminiChatCompletion(
   }
 }
 
-async function searxngSearch(query: string): Promise<string> {
+function normalizeBraveSearchResults(
+  response: BraveSearchResponse
+): BraveSearchResult[] {
+  return (response.web?.results || [])
+    .map((result) => ({
+      title: result.title ?? "",
+      url: result.url ?? "",
+      content: [result.description ?? "", ...(result.extra_snippets ?? [])]
+        .filter(Boolean)
+        .join("\n"),
+    }))
+    .filter((result) => Boolean(result.title || result.url || result.content));
+}
+
+async function braveSearch(query: string): Promise<string> {
   try {
-    const params = new URLSearchParams({ q: query, format: "json" });
+    const apiKey = getBraveSearchApiKey();
+    if (!apiKey) {
+      return "Search error: BRAVE_SEARCH_API_KEY or BRAVE_API_KEY is not configured";
+    }
+
+    const params = new URLSearchParams({
+      q: query,
+      count: "5",
+      country: "JP",
+      search_lang: "ja",
+      extra_snippets: "true",
+    });
     const response = await fetch(
-      `${getSearxngUrl()}/search?${params.toString()}`,
+      `${getBraveSearchApiUrl()}?${params.toString()}`,
       {
         method: "GET",
         headers: {
           Accept: "application/json",
+          "Accept-Encoding": "gzip",
+          "X-Subscription-Token": apiKey,
         },
         signal: AbortSignal.timeout(15_000),
       }
@@ -647,11 +691,11 @@ async function searxngSearch(query: string): Promise<string> {
       console.warn(
         `[Agent][Tool] web_search failed (${response.status}): query="${query}"`
       );
-      return `Search error: status ${response.status}`;
-    }
+        return `Search error: status ${response.status}`;
+      }
 
-    const data = (await response.json()) as SearXNGResponse;
-    const results = data.results || [];
+    const data = (await response.json()) as BraveSearchResponse;
+    const results = normalizeBraveSearchResults(data);
 
     if (results.length === 0) {
       return "No search results found.";
@@ -1027,7 +1071,7 @@ async function runAgentForShop(
 
   try {
     const evidenceStartedAt = performance.now();
-    const evidence = await searxngSearch(searchQuery);
+    const evidence = await braveSearch(searchQuery);
     const evidenceMs = Math.round(performance.now() - evidenceStartedAt);
     const llmStartedAt = performance.now();
     const content = await callLLMForAgent(
@@ -1537,15 +1581,31 @@ function buildEvidenceSearchQueries(shop: AgentShop, userKeyword?: string): stri
   return queries.filter((query, index, list) => list.indexOf(query) === index).slice(0, 3);
 }
 
-async function searxngSearchResults(query: string): Promise<SearXNGResult[]> {
+async function braveSearchResults(query: string): Promise<BraveSearchResult[]> {
   try {
-    const params = new URLSearchParams({ q: query, format: "json" });
+    const apiKey = getBraveSearchApiKey();
+    if (!apiKey) {
+      console.warn(
+        `[Agent][Retriever] Brave Search API key is missing: query="${query}"`
+      );
+      return [];
+    }
+
+    const params = new URLSearchParams({
+      q: query,
+      count: String(MAX_SEARCH_RESULTS_PER_QUERY),
+      country: "JP",
+      search_lang: "ja",
+      extra_snippets: "true",
+    });
     const response = await fetch(
-      `${getSearxngUrl()}/search?${params.toString()}`,
+      `${getBraveSearchApiUrl()}?${params.toString()}`,
       {
         method: "GET",
         headers: {
           Accept: "application/json",
+          "Accept-Encoding": "gzip",
+          "X-Subscription-Token": apiKey,
         },
         signal: AbortSignal.timeout(15_000),
       }
@@ -1558,8 +1618,8 @@ async function searxngSearchResults(query: string): Promise<SearXNGResult[]> {
       return [];
     }
 
-    const data = (await response.json()) as SearXNGResponse;
-    return (data.results || []).slice(0, MAX_SEARCH_RESULTS_PER_QUERY);
+    const data = (await response.json()) as BraveSearchResponse;
+    return normalizeBraveSearchResults(data).slice(0, MAX_SEARCH_RESULTS_PER_QUERY);
   } catch (error) {
     console.error("[Agent][Retriever] web_search error:", error);
     return [];
@@ -1590,7 +1650,7 @@ async function collectEvidenceBundle(
   const queryResults = await Promise.all(
     queries.map(async (query) => ({
       query,
-      results: await searxngSearchResults(query),
+      results: await braveSearchResults(query),
     }))
   );
 

@@ -48,6 +48,7 @@ function createPlace(
 beforeEach(() => {
   process.env = {
     ...ORIGINAL_ENV,
+    NODE_ENV: "test",
     DEPLOY_MODE: "external",
     GOOGLE_MAPS_SERVER_API_KEY: "google-test-key",
   };
@@ -229,8 +230,8 @@ describe("collectCandidateShops", () => {
     const candidates = await collectCandidateShops(35.6595, 139.7005, 500, "映画");
 
     expect(candidates.map((candidate) => candidate.place_id)).toEqual([
-      "cinema-prime",
       "duplicate-cafe",
+      "cinema-prime",
       "cafe-nearby",
     ]);
     expect(candidates.some((candidate) => candidate.place_id === "outside-radius")).toBe(

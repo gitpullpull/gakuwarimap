@@ -492,7 +492,7 @@ export default function AgentSearch() {
               <p className="mb-4 text-sm text-muted-foreground">
                 Google Maps から指定範囲内の候補店舗を広く集めたあと、
                 <br />
-                Web検索（SearXNG）と AI の再確認で学割情報を深掘りしています。
+                Web検索（Brave Search API）と AI の再確認で学割情報を深掘りしています。
                 <br />
                 <span className="mt-1 block text-xs">
                   使用中のAI: {llmProvider === "ollama" ? "Ollama（ローカルLLM）" : "Gemini API"}・通常は30〜60秒ほどで完了します。

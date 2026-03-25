@@ -11,7 +11,7 @@ import type { TrpcContext } from "./_core/context";
  * 3. Error handling for invalid inputs
  *
  * Note: searchGakuwari integration test is skipped by default because it
- * requires Gemini + SearXNG external services and takes time to run.
+ * requires Gemini + Brave Search external services and takes time to run.
  * Run manually with: pnpm test -- --testNamePattern="integration"
  */
 
@@ -68,7 +68,7 @@ describe("agent.searchGakuwari", () => {
   });
 
   it.skip(
-    "integration: calls Gemini + SearXNG and returns results",
+    "integration: calls Gemini + Brave Search and returns results",
     { timeout: 600_000 },
     async () => {
       const ctx = createPublicContext();
