@@ -479,7 +479,47 @@ async function callGeminiChatCompletion(
   }
 }
 
+/**
+ * Google Custom Search API で検索する。
+ * GOOGLE_CSE_API_KEY と GOOGLE_CSE_ID が設定されている場合に使用。
+ */
+async function googleCseSearch(query: string): Promise<string | null> {
+  const apiKey = process.env.GOOGLE_CSE_API_KEY?.trim();
+  const cseId = process.env.GOOGLE_CSE_ID?.trim();
+  if (!apiKey || !cseId) return null;
+
+  try {
+    const params = new URLSearchParams({ key: apiKey, cx: cseId, q: query, num: "5", lr: "lang_ja" });
+    const response = await fetch(
+      `https://www.googleapis.com/customsearch/v1?${params}`,
+      { signal: AbortSignal.timeout(10_000) }
+    );
+    if (!response.ok) {
+      console.warn(`[Agent][CSE] search failed (${response.status}): query="${query}"`);
+      return null;
+    }
+    const data = (await response.json()) as { items?: Array<{ title: string; link: string; snippet?: string }> };
+    const items = data.items ?? [];
+    if (items.length === 0) return "No search results found.";
+    return items
+      .slice(0, 5)
+      .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.link}\n${r.snippet ?? "(no summary)"}`)
+      .join("\n\n");
+  } catch (error) {
+    console.warn(`[Agent][CSE] error: ${error instanceof Error ? error.message : error}`);
+    return null;
+  }
+}
+
 async function searxngSearch(query: string): Promise<string> {
+  // Google Custom Search API が設定されていれば優先使用
+  const cseResult = await googleCseSearch(query);
+  if (cseResult !== null) {
+    console.log(`[Agent][CSE] query="${query}" → ${cseResult === "No search results found." ? "0件" : "結果あり"}`);
+    return cseResult;
+  }
+
+  // フォールバック: SearXNG
   try {
     const params = new URLSearchParams({ q: query, format: "json" });
     const response = await fetch(
