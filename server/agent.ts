@@ -5,6 +5,7 @@ import {
 } from "./_core/map";
 import { resolveMapsMode } from "./_core/platform";
 import { createLLMProvider } from "./_core/providers";
+import type { Message, Tool } from "./_core/llmTypes";
 
 export interface AgentShop {
   name: string;
@@ -111,30 +112,49 @@ const DEFAULT_GEMINI_OPENAI_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai";
 const MAX_SHOPS = 20;
 const BATCH_SIZE = 6;
+const MAX_AGENT_LOOPS = 5;
 const AGENT_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 const AGENT_CACHE_ENABLED = process.env.DISABLE_AGENT_CACHE !== "true";
 
-const SYSTEM_PROMPT = [
-  "You verify whether a place offers a student discount.",
-  "Use only the provided store info and evidence snippets.",
-  "Do not make up discounts that are not supported by the evidence.",
-  "The following all count as valid student discounts:",
-  "  - 学割, 学生割引, 学生料金, 学生価格",
-  "  - 学生カット, 学割U24, U24, 学生限定クーポン",
-  "  - 高校生料金, 大学生料金, 高校生・大学生, 学生無料",
-  "  - For museums, galleries, science centers, and cultural facilities:",
-  "    tiered admission where the 学生 (student) price is lower than the 一般 (general adult) price",
-  "    is a valid student discount. Example: 一般1500円 / 学生800円 → has_gakuwari=true.",
-  "  - 常設展無料 (free permanent exhibitions) for students or under-18 visitors.",
-  "Return a JSON object only with these keys:",
-  '{"has_gakuwari":true,"discount_info":"string","source_url":"string","confidence":"high|medium|low"}',
-  "Rules for discount_info:",
-  "  - When has_gakuwari=true: discount_info MUST be a non-empty summary of the discount",
-  "    (e.g., '学生200円（一般400円）', '大学生以下無料', '学生証提示で20%OFF').",
-  "  - When has_gakuwari=false: use empty string for discount_info.",
-  "Use empty string for source_url when unavailable.",
-  "confidence should be \"high\" only when the discount is explicitly confirmed by a reliable source.",
-].join("\n");
+// エージェントループ用システムプロンプト（旧コードと同じアプローチ）
+const SYSTEM_PROMPT = `あなたは店舗の学割情報を調査するエージェントです。
+与えられた店舗名についてweb_searchツールを使って学割・学生割引情報を調べてください。
+
+調査手順:
+1. まず「店舗名 学割」「店舗名 学生割引」などで検索してください
+2. 検索結果から学割情報を確認してください
+3. 美術館・博物館・科学館などの文化施設は、一般料金より安い学生料金がある場合も学割ありとします（例: 一般1500円/学生800円 → 学割あり）
+4. カラオケは「学割フリータイム」「学生フリータイム」なども学割として扱います
+5. 情報が見つからない場合は、チェーン名（例:「まねきねこ 学割」）で再検索してください
+
+最終的に以下のJSON形式のみで回答してください（他のテキストは不要）:
+{"has_gakuwari": true/false, "discount_info": "学割の具体的な内容", "source_url": "情報源のURL", "confidence": "high/medium/low"}
+
+ルール:
+- has_gakuwari=trueの場合は必ずdiscount_infoに具体的な内容を記入（例: 「学生200円（一般400円）」「学割フリータイム1980円」）
+- has_gakuwari=falseの場合はdiscount_infoは空文字
+- confidence: 公式サイト="high"、口コミ/まとめサイト="medium"、推測="low"
+- source_urlはURLが確認できた場合のみ記入
+
+/no_think`;
+
+const WEB_SEARCH_TOOL: Tool = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description: "Web検索を行う。店舗の学割・学生割引情報を調べるために使う。",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "検索クエリ（例: 「大阪市立科学館 学生料金 入館料」）",
+        },
+      },
+      required: ["query"],
+    },
+  },
+};
 
 const DEFAULT_PARSED_RESULT: ParsedAgentResult = {
   has_gakuwari: false,
@@ -686,39 +706,82 @@ async function runAgentForShop(
     return cached;
   }
 
-  const searchQuery = buildEvidenceSearchQuery(shop);
-  console.log(`[Agent][Tool] web_search query="${searchQuery}"`);
+  const llm = createLLMProvider({
+    ...process.env,
+    LLM_PROVIDER: llmProvider,
+  });
+
+  const messages: Message[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    {
+      role: "user",
+      content: `「${shop.name}」（住所: ${shop.address || "不明"}）の学割情報を調べてください。`,
+    },
+  ];
+
+  let finalContent = "";
 
   try {
-    const evidenceStartedAt = performance.now();
-    const evidence = await searxngSearch(searchQuery);
-    const evidenceMs = Math.round(performance.now() - evidenceStartedAt);
-    const llmStartedAt = performance.now();
+    for (let loop = 0; loop < MAX_AGENT_LOOPS; loop++) {
+      console.log(`[Agent] "${shop.name}" loop=${loop + 1}`);
+      const result = await llm.invoke({ messages, tools: [WEB_SEARCH_TOOL] });
+      const message = result.choices[0]?.message;
+      if (!message) break;
 
-    const content = await callLLMForAgent(
-      [
-        { role: "system", content: SYSTEM_PROMPT },
-        {
-          role: "user",
-          content: buildEvidenceReviewMessage(shop, searchQuery, evidence),
-        },
-      ],
-      llmProvider
-    );
+      messages.push({
+        role: message.role,
+        content: message.content,
+        ...(message.tool_calls?.length ? { tool_calls: message.tool_calls } : {}),
+      });
 
-    const llmMs = Math.round(performance.now() - llmStartedAt);
-    console.log(`[Agent][LLM] "${shop.name}" evidence=${evidenceMs}ms llm=${llmMs}ms raw=${JSON.stringify(content.slice(0, 300))}`);
-    const parsed = parseAgentResult(shop, content);
-    console.log(`[Agent][Result] "${shop.name}" has_gakuwari=${parsed.has_gakuwari} confidence=${parsed.confidence} discount_info=${JSON.stringify(parsed.discount_info)}`);
-    cacheAgentResult(parsed);
+      if (!message.tool_calls || message.tool_calls.length === 0) {
+        finalContent =
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .map((c) => (c.type === "text" ? c.text : ""))
+                .join("");
+        break;
+      }
+
+      for (const toolCall of message.tool_calls) {
+        if (toolCall.function.name === "web_search") {
+          let args: { query?: string } = {};
+          try {
+            args = JSON.parse(toolCall.function.arguments);
+          } catch {
+            /* ignore */
+          }
+          const query = args.query ?? `${shop.name} 学割`;
+          console.log(`[Agent][Tool] "${shop.name}" web_search="${query}"`);
+          const searchResult = await searxngSearch(query);
+          messages.push({
+            role: "tool",
+            content: searchResult,
+            tool_call_id: toolCall.id,
+          });
+        }
+      }
+    }
+
+    if (!finalContent) {
+      const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+      finalContent =
+        typeof lastAssistant?.content === "string" ? lastAssistant.content : "";
+    }
+
+    const totalMs = Math.round(performance.now() - startedAt);
     console.log(
-      `[Agent][Timing][${llmProvider}] Shop="${shop.name}" evidenceMs=${evidenceMs} llmMs=${llmMs} totalMs=${Math.round(
-        performance.now() - startedAt
-      )}`
+      `[Agent][LLM] "${shop.name}" total=${totalMs}ms raw=${JSON.stringify(finalContent.slice(0, 300))}`
     );
+    const parsed = parseAgentResult(shop, finalContent);
+    console.log(
+      `[Agent][Result] "${shop.name}" has_gakuwari=${parsed.has_gakuwari} confidence=${parsed.confidence} discount_info=${JSON.stringify(parsed.discount_info)}`
+    );
+    cacheAgentResult(parsed);
     return parsed;
   } catch (error) {
-    console.error(`[Agent][${llmProvider}] Shop="${shop.name}" failed:`, error);
+    console.error(`[Agent][${llmProvider}] "${shop.name}" failed:`, error);
     return createDefaultResult(shop);
   }
 }
