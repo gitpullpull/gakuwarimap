@@ -4,6 +4,7 @@ import {
   type PlacesSearchResult,
 } from "./_core/map";
 import { resolveMapsMode } from "./_core/platform";
+import { createLLMProvider } from "./_core/providers";
 
 export interface AgentShop {
   name: string;
@@ -338,6 +339,44 @@ export function parseAgentResult(
   };
 }
 
+export type LLMProviderMode = "gemini" | "ollama";
+
+/**
+ * Unified LLM call that supports Gemini (default) and Ollama.
+ * Returns the assistant message content as a string.
+ */
+async function callLLMForAgent(
+  messages: AgentMessage[],
+  provider: LLMProviderMode = "gemini"
+): Promise<string> {
+  if (provider === "ollama") {
+    const llm = createLLMProvider({
+      ...process.env,
+      LLM_PROVIDER: "ollama",
+    });
+    console.log(`[Agent][Ollama] Requesting chat completion model=${process.env.OLLAMA_MODEL ?? process.env.LLM_MODEL ?? "qwen3.5:27b"}`);
+    const result = await llm.invoke({
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.name ? { name: m.name } : {}),
+        ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+      })),
+    });
+    const raw = result.choices?.[0]?.message?.content;
+    if (!raw) throw new Error("Ollama returned no message");
+    return typeof raw === "string"
+      ? raw
+      : raw.map((c) => (c.type === "text" ? c.text : "")).join("");
+  }
+
+  // Default: Gemini via OpenAI-compatible endpoint
+  const geminiResult = await callGeminiChatCompletion(messages);
+  const content = geminiResult.choices?.[0]?.message?.content;
+  if (!content) throw new Error("Gemini returned no message");
+  return content;
+}
+
 async function callGeminiChatCompletion(
   messages: AgentMessage[],
   tools: AgentTool[] = []
@@ -552,7 +591,10 @@ function buildEvidenceReviewMessage(
   return lines.join("\n");
 }
 
-async function runAgentForShop(shop: AgentShop): Promise<AgentResultItem> {
+async function runAgentForShop(
+  shop: AgentShop,
+  llmProvider: LLMProviderMode = "gemini"
+): Promise<AgentResultItem> {
   const startedAt = performance.now();
   const cached = getCachedAgentResult(shop);
   if (cached) {
@@ -567,31 +609,30 @@ async function runAgentForShop(shop: AgentShop): Promise<AgentResultItem> {
     const evidenceStartedAt = performance.now();
     const evidence = await searxngSearch(searchQuery);
     const evidenceMs = Math.round(performance.now() - evidenceStartedAt);
-    const geminiStartedAt = performance.now();
-    const result = await callGeminiChatCompletion([
-      { role: "system", content: SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: buildEvidenceReviewMessage(shop, searchQuery, evidence),
-      },
-    ]);
-    const geminiMs = Math.round(performance.now() - geminiStartedAt);
-    const content = result.choices?.[0]?.message?.content;
+    const llmStartedAt = performance.now();
 
-    if (!content) {
-      throw new Error("Gemini returned no message");
-    }
+    const content = await callLLMForAgent(
+      [
+        { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: buildEvidenceReviewMessage(shop, searchQuery, evidence),
+        },
+      ],
+      llmProvider
+    );
 
+    const llmMs = Math.round(performance.now() - llmStartedAt);
     const parsed = parseAgentResult(shop, content);
     cacheAgentResult(parsed);
     console.log(
-      `[Agent][Timing] Shop="${shop.name}" evidenceMs=${evidenceMs} geminiMs=${geminiMs} totalMs=${Math.round(
+      `[Agent][Timing][${llmProvider}] Shop="${shop.name}" evidenceMs=${evidenceMs} llmMs=${llmMs} totalMs=${Math.round(
         performance.now() - startedAt
       )}`
     );
     return parsed;
   } catch (error) {
-    console.error(`[Agent][Gemini] Shop="${shop.name}" failed:`, error);
+    console.error(`[Agent][${llmProvider}] Shop="${shop.name}" failed:`, error);
     return createDefaultResult(shop);
   }
 }
@@ -706,7 +747,8 @@ export async function searchGakuwariSpots(
   lat: number,
   lng: number,
   radius: number = 500,
-  keyword?: string
+  keyword?: string,
+  llmProvider: LLMProviderMode = "gemini"
 ): Promise<GakuwariSearchResult[]> {
   const startedAt = performance.now();
   const shops = (await searchNearbyPlacesBase(lat, lng, radius, keyword)).slice(
@@ -720,7 +762,7 @@ export async function searchGakuwariSpots(
   }
 
   console.log(
-    `[Agent][Gemini] Investigating ${shops.length} nearby shops for discounts`
+    `[Agent][${llmProvider}] Investigating ${shops.length} nearby shops for discounts`
   );
 
   const enrichedShopsPromise = enrichShopsWithPlaceDetails(shops);
@@ -729,11 +771,11 @@ export async function searchGakuwariSpots(
   for (let index = 0; index < shops.length; index += BATCH_SIZE) {
     const batch = shops.slice(index, index + BATCH_SIZE);
     const batchResults = await Promise.all(
-      batch.map((shop) => runAgentForShop(shop))
+      batch.map((shop) => runAgentForShop(shop, llmProvider))
     );
     allResults.push(...batchResults);
     console.log(
-      `[Agent][Gemini] Completed ${Math.min(index + BATCH_SIZE, shops.length)}/${shops.length} shops`
+      `[Agent][${llmProvider}] Completed ${Math.min(index + BATCH_SIZE, shops.length)}/${shops.length} shops`
     );
   }
 
