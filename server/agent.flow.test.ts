@@ -321,6 +321,101 @@ describe("searchGakuwariSpots", () => {
     );
   });
 
+  it("logs matched categories and API boost metadata for curated keywords", async () => {
+    const broadResults = [
+      createPlace("Izakaya Student", 35.1, 139.1, {
+        placeId: "izakaya_student",
+        type: "restaurant",
+        address: "Tokyo Izakaya",
+      }),
+    ];
+
+    mockedMakeRequest.mockImplementation(
+      createPlacesMock({
+        broadResults,
+        typeResults: {
+          restaurant: broadResults,
+        },
+        detailsById: {
+          izakaya_student: {
+            website: "https://izakaya.example.com",
+            formatted_address: "Tokyo Izakaya",
+          },
+        },
+      })
+    );
+
+    const fetchMock = createFetchMock({
+      "Izakaya Student": {
+        verifierContent:
+          '{"has_gakuwari":true,"discount_info":"学生限定コース","source_url":"https://izakaya.example.com/student","confidence":"medium"}',
+        searchContent: "学生限定コースあり",
+        searchUrl: "https://izakaya.example.com/student",
+      },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.stubGlobal("fetch", fetchMock);
+
+    await searchGakuwariSpots(35.1, 139.1, 500, "居酒屋");
+
+    const diagnosticLines = logSpy.mock.calls.flat().map((value) => String(value));
+    expect(
+      diagnosticLines.some(
+        (line) =>
+          line.includes('"event":"search_summary"') &&
+          line.includes('"matchedCategoryIds":["food_drink"]') &&
+          line.includes('"apiBoostEnabled":true') &&
+          line.includes('"profiles":["broad","restaurant"]')
+      )
+    ).toBe(true);
+  });
+
+  it("logs broad-only reasons for unknown keywords", async () => {
+    const broadResults = [
+      createPlace("Gift Card Shop", 35.1, 139.1, {
+        placeId: "gift_card_shop",
+        type: "store",
+        address: "Tokyo Unknown",
+      }),
+    ];
+
+    mockedMakeRequest.mockImplementation(
+      createPlacesMock({
+        broadResults,
+        detailsById: {
+          gift_card_shop: {
+            website: "https://unknown.example.com",
+            formatted_address: "Tokyo Unknown",
+          },
+        },
+      })
+    );
+
+    const fetchMock = createFetchMock({
+      "Gift Card Shop": {
+        verifierContent:
+          '{"has_gakuwari":false,"discount_info":"","source_url":"","confidence":"low"}',
+        searchContent: "No student discount found",
+      },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.stubGlobal("fetch", fetchMock);
+
+    await searchGakuwariSpots(35.1, 139.1, 500, "金券ショップ");
+
+    const diagnosticLines = logSpy.mock.calls.flat().map((value) => String(value));
+    expect(
+      diagnosticLines.some(
+        (line) =>
+          line.includes('"event":"search_summary"') &&
+          line.includes('"matchedCategoryIds":[]') &&
+          line.includes('"apiBoostEnabled":false') &&
+          line.includes('"broadOnlyReason":"keyword_not_in_catalog"') &&
+          line.includes('"profiles":["broad"]')
+      )
+    ).toBe(true);
+  });
+
   it("halts a candidate after a non-retryable Brave failure and skips Gemini", async () => {
     const broadResults = [
       createPlace("Cafe Fail", 35.1, 139.1, {
@@ -705,7 +800,7 @@ describe("searchGakuwariSpots", () => {
       confidence: "medium",
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(mockedMakeRequest).toHaveBeenCalledTimes(4);
+    expect(mockedMakeRequest).toHaveBeenCalledTimes(3);
   });
 
   it("lets the reviewer recover a high-priority low-confidence negative", async () => {

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  buildAgentTeamProfiles,
+  buildEvidenceSearchQueries,
   collectCandidateShops,
   getAgentCacheKeyForPlace,
   parseAgentResultContent,
@@ -162,7 +164,100 @@ describe("searchNearbyPlaces address fallback", () => {
   });
 });
 
+describe("buildAgentTeamProfiles", () => {
+  it.each([
+    ["居酒屋", ["broad", "restaurant"]],
+    ["ボウリング", ["broad", "karaoke_amusement"]],
+    ["水族館", ["broad", "ticketed_venue"]],
+    ["漫画喫茶", ["broad", "study_space"]],
+    ["ネイル", ["broad", "beauty_services"]],
+    ["金券ショップ", ["broad"]],
+  ])("maps %s to the expected specialty profiles", (keyword, expectedIds) => {
+    expect(buildAgentTeamProfiles(keyword).map((profile) => profile.id)).toEqual(
+      expectedIds
+    );
+  });
+});
+
+describe("buildEvidenceSearchQueries", () => {
+  it("includes category terms and matched aliases for ticketed venues within the cap", () => {
+    const queries = buildEvidenceSearchQueries(
+      {
+        name: "渋谷水族館",
+        address: "東京都渋谷区1-1-1",
+        place_id: "ticketed",
+        website: "https://ticketed.example.com",
+        lat: 35.0,
+        lng: 139.0,
+        types: ["aquarium"],
+      },
+      "水族館"
+    );
+
+    expect(queries).toHaveLength(2);
+    expect(queries.join(" ")).toContain("水族館");
+    expect(queries.join(" ")).toContain("学生料金");
+  });
+});
+
 describe("collectCandidateShops", () => {
+  it("uses a matched specialty profile for curated keywords but stays broad-only for unknown ones", async () => {
+    mockedMakeRequest.mockImplementation(async (endpoint, params) => {
+      if (endpoint !== "/maps/api/place/nearbysearch/json") {
+        throw new Error(`Unexpected endpoint: ${String(endpoint)}`);
+      }
+
+      const request = params as Record<string, unknown>;
+      const type = String(request.type ?? "");
+      const keyword = String(request.keyword ?? "");
+
+      if (!type) {
+        return {
+          status: "OK",
+          results: [
+            createPlace(`Broad ${keyword || "default"}`, 35.6596, 139.7004, {
+              placeId: `broad-${keyword || "default"}`,
+              type: "restaurant",
+            }),
+          ],
+        } as never;
+      }
+
+      return {
+        status: "OK",
+        results: [
+          createPlace(`Typed ${type}`, 35.6597, 139.7005, {
+            placeId: `typed-${type}`,
+            type,
+          }),
+        ],
+      } as never;
+    });
+
+    await collectCandidateShops(35.6595, 139.7005, 500, "居酒屋");
+    const preparedCalls = mockedMakeRequest.mock.calls
+      .filter(([endpoint]) => endpoint === "/maps/api/place/nearbysearch/json")
+      .map(([, params]) => params as Record<string, unknown>);
+
+    expect(preparedCalls).toHaveLength(2);
+    expect(
+      preparedCalls.some(
+        (params) => params.type === "restaurant" && params.keyword === "居酒屋"
+      )
+    ).toBe(true);
+
+    mockedMakeRequest.mockClear();
+
+    await collectCandidateShops(35.6595, 139.7005, 500, "金券ショップ");
+    const unknownCalls = mockedMakeRequest.mock.calls
+      .filter(([endpoint]) => endpoint === "/maps/api/place/nearbysearch/json")
+      .map(([, params]) => params as Record<string, unknown>);
+
+    expect(unknownCalls).toHaveLength(1);
+    expect(unknownCalls[0]?.type).toBeUndefined();
+    expect(unknownCalls[0]?.keyword).toBe("金券ショップ");
+  });
+
   it("merges multiple search profiles, paginates, dedupes, and keeps only in-radius results", async () => {
     mockedMakeRequest.mockImplementation(async (endpoint, params) => {
       if (endpoint === "/maps/api/place/nearbysearch/json") {

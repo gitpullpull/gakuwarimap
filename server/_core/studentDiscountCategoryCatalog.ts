@@ -568,10 +568,7 @@ function isAliasMatch(normalizedValue: string, normalizedAlias: string): boolean
     return false;
   }
 
-  return (
-    normalizedValue.includes(normalizedAlias) ||
-    (normalizedValue.length >= 3 && normalizedAlias.includes(normalizedValue))
-  );
+  return normalizedValue.includes(normalizedAlias);
 }
 
 const PREPARED_CATEGORIES: PreparedCategory[] = CATEGORY_DEFINITIONS.map((category) => ({
@@ -638,7 +635,29 @@ export function matchKeywordAliases(keyword?: string): AliasMatch[] {
     }
   }
 
-  return matches;
+  const sortedMatches = [...matches].sort((left, right) => right.alias.length - left.alias.length);
+  const filteredMatches: AliasMatch[] = [];
+
+  for (const match of sortedMatches) {
+    if (filteredMatches.some((existing) => existing.profileId === match.profileId)) {
+      continue;
+    }
+
+    if (
+      filteredMatches.some(
+        (existing) =>
+          existing.profileId !== match.profileId &&
+          existing.alias.length > match.alias.length &&
+          existing.alias.includes(match.alias)
+      )
+    ) {
+      continue;
+    }
+
+    filteredMatches.push(match);
+  }
+
+  return filteredMatches;
 }
 
 export function selectCategorySearchProfiles(keyword?: string): SearchProfileSelection {
