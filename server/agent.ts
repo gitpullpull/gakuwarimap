@@ -117,7 +117,14 @@ const SYSTEM_PROMPT = [
   "You verify whether a place offers a student discount.",
   "Use only the provided store info and evidence snippets.",
   "Do not make up discounts that are not supported by the evidence.",
-  "Treat category-specific student pricing such as 学生カット, 学割U24, U24, 学生限定クーポン, and 高校生 or 大学生料金 as valid student discounts.",
+  "The following all count as valid student discounts:",
+  "  - 学割, 学生割引, 学生料金, 学生価格",
+  "  - 学生カット, 学割U24, U24, 学生限定クーポン",
+  "  - 高校生料金, 大学生料金, 高校生・大学生, 学生無料",
+  "  - For museums, galleries, science centers, and cultural facilities:",
+  "    tiered admission where the 学生 (student) price is lower than the 一般 (general adult) price",
+  "    is a valid student discount. Example: 一般1500円 / 学生800円 → has_gakuwari=true.",
+  "  - 常設展無料 (free permanent exhibitions) for students or under-18 visitors.",
   "Return a JSON object only with these keys:",
   '{"has_gakuwari":true,"discount_info":"string","source_url":"string","confidence":"high|medium|low"}',
   "Use an empty string when discount details or source_url are unavailable.",
@@ -541,6 +548,21 @@ function isKaraoke(shop: AgentShop): boolean {
   );
 }
 
+function isMuseum(shop: AgentShop): boolean {
+  const types = shop.types ?? [];
+  if (
+    types.includes("museum") ||
+    types.includes("art_gallery") ||
+    types.includes("aquarium") ||
+    types.includes("zoo")
+  ) {
+    return true;
+  }
+  return /美術館|博物館|科学館|資料館|記念館|水族館|動物園|歴史館|文化館|ギャラリー|gallery/i.test(
+    shop.name
+  );
+}
+
 /**
  * ブランチ名（例: "京橋店"）を除いたチェーン名を返す。
  * "カラオケまねきねこ 京橋店" → "まねきねこ"
@@ -562,7 +584,10 @@ function buildEvidenceSearchQuery(shop: AgentShop): string {
 
   const searchTerms = ["学割", "学生"];
 
-  if (isBeautySalon(shop)) {
+  if (isMuseum(shop)) {
+    searchTerms.push("学生料金", "入館料", "常設展", "割引", "無料");
+    if (host) searchTerms.push(host);
+  } else if (isBeautySalon(shop)) {
     searchTerms.push(
       "学生カット",
       "学割U24",
@@ -601,12 +626,26 @@ function buildEvidenceReviewMessage(
   lines.push("Evidence snippets:");
   lines.push(evidence);
   lines.push("Check whether the store offers a student discount.");
-  lines.push(
-    "If the evidence does not explicitly support a student discount, return has_gakuwari=false."
-  );
-  lines.push(
-    "Treat 学生カット, 学割U24, U24, 学生限定クーポン, 高校生料金, and 大学生料金 as valid student discounts."
-  );
+
+  if (isMuseum(shop)) {
+    lines.push(
+      "This is a museum/gallery/cultural facility. In Japan, these always have tiered admission pricing."
+    );
+    lines.push(
+      "If the evidence shows a 学生 (student) admission price lower than the 一般 (general adult) price, set has_gakuwari=true."
+    );
+    lines.push(
+      "If the evidence mentions 常設展無料 or free admission for students, set has_gakuwari=true."
+    );
+  } else {
+    lines.push(
+      "If the evidence does not explicitly support a student discount, return has_gakuwari=false."
+    );
+    lines.push(
+      "Treat 学生カット, 学割U24, U24, 学生限定クーポン, 高校生料金, and 大学生料金 as valid student discounts."
+    );
+  }
+
   lines.push("Return JSON only.");
 
   return lines.join("\n");
