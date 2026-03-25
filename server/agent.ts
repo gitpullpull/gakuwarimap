@@ -112,6 +112,7 @@ const DEFAULT_GEMINI_OPENAI_BASE_URL =
 const MAX_SHOPS = 20;
 const BATCH_SIZE = 6;
 const AGENT_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
+const AGENT_CACHE_ENABLED = process.env.DISABLE_AGENT_CACHE !== "true";
 
 const SYSTEM_PROMPT = [
   "You verify whether a place offers a student discount.",
@@ -266,16 +267,27 @@ function extractFirstJsonObject(text: string): string | null {
   return null;
 }
 
-function parseJsonRecord(text: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    return null;
-  }
+/**
+ * LLMが "confidence":low のように値をクォートしないケースを修正する
+ */
+function fixUnquotedJsonValues(text: string): string {
+  return text.replace(
+    /"(confidence)"\s*:\s*(high|medium|low)\s*([,}])/gi,
+    '"$1":"$2"$3'
+  );
+}
 
+function parseJsonRecord(text: string): Record<string, unknown> | null {
+  for (const candidate of [text, fixUnquotedJsonValues(text)]) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // try next candidate
+    }
+  }
   return null;
 }
 
@@ -303,13 +315,14 @@ export function parseAgentResultContent(content: string): ParsedAgentResult {
     return DEFAULT_PARSED_RESULT;
   }
 
+  const fenced = extractFencedJson(trimmed);
+  const firstObj = extractFirstJsonObject(trimmed);
   const candidates = [
     trimmed,
-    extractFencedJson(trimmed),
-    extractFirstJsonObject(trimmed),
-    extractFencedJson(trimmed)
-      ? extractFirstJsonObject(extractFencedJson(trimmed)!)
-      : null,
+    fenced,
+    firstObj,
+    fenced ? extractFirstJsonObject(fenced) : null,
+    firstObj ? fixUnquotedJsonValues(firstObj) : null,
   ].filter((candidate): candidate is string => Boolean(candidate));
 
   for (const candidate of candidates) {
@@ -319,8 +332,9 @@ export function parseAgentResultContent(content: string): ParsedAgentResult {
     }
   }
 
+  // Regex fallback: only match on clear positive discount signals, not JSON key names
   const hasGakuwari =
-    /student.?discount|gakuwari|学割|学生カット|学割U24|学生限定|高校生|大学生料金/i.test(
+    /student discount|has.student|学割あり|学生割引あり|学生カット|学割U24|学生限定|高校生料金|大学生料金|学生料金|常設展無料/i.test(
       trimmed
     ) &&
     !/not found|no student discount|unable to confirm|確認できません|見つかりません|学生向けの割引は確認できません/i.test(
@@ -487,6 +501,8 @@ async function searxngSearch(query: string): Promise<string> {
 }
 
 function getCachedAgentResult(shop: AgentShop): AgentResultItem | null {
+  if (!AGENT_CACHE_ENABLED) return null;
+
   const cached = agentResultCache.get(shop.place_id);
 
   if (!cached) {
@@ -506,6 +522,7 @@ function getCachedAgentResult(shop: AgentShop): AgentResultItem | null {
 }
 
 function cacheAgentResult(result: AgentResultItem): void {
+  if (!AGENT_CACHE_ENABLED) return;
   agentResultCache.set(result.place_id, {
     expiresAt: Date.now() + AGENT_CACHE_TTL_MS,
     result: {
