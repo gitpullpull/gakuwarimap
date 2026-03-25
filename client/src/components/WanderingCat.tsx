@@ -20,10 +20,28 @@ const CAT_FRAMES = {
   leftToFront: 13,
 } as const;
 
-const RIGHT_WALK_SEQUENCE = [CAT_FRAMES.rightWalk1, CAT_FRAMES.rightWalk2, CAT_FRAMES.rightWalk3, CAT_FRAMES.rightWalk4] as const;
-const LEFT_WALK_SEQUENCE = [CAT_FRAMES.leftWalk1, CAT_FRAMES.leftWalk2, CAT_FRAMES.leftWalk3, CAT_FRAMES.leftWalk4] as const;
-const TURN_RIGHT_TO_LEFT_SEQUENCE = [CAT_FRAMES.rightToFront, CAT_FRAMES.front, CAT_FRAMES.leftToFront] as const;
-const TURN_LEFT_TO_RIGHT_SEQUENCE = [CAT_FRAMES.leftToFront, CAT_FRAMES.front, CAT_FRAMES.rightToFront] as const;
+const RIGHT_WALK_SEQUENCE = [
+  CAT_FRAMES.rightWalk1,
+  CAT_FRAMES.rightWalk2,
+  CAT_FRAMES.rightWalk3,
+  CAT_FRAMES.rightWalk4,
+] as const;
+const LEFT_WALK_SEQUENCE = [
+  CAT_FRAMES.leftWalk1,
+  CAT_FRAMES.leftWalk2,
+  CAT_FRAMES.leftWalk3,
+  CAT_FRAMES.leftWalk4,
+] as const;
+const TURN_RIGHT_TO_LEFT_SEQUENCE = [
+  CAT_FRAMES.rightToFront,
+  CAT_FRAMES.front,
+  CAT_FRAMES.leftToFront,
+] as const;
+const TURN_LEFT_TO_RIGHT_SEQUENCE = [
+  CAT_FRAMES.leftToFront,
+  CAT_FRAMES.front,
+  CAT_FRAMES.rightToFront,
+] as const;
 
 type Direction = "right" | "left";
 type Mode = "walk" | "front" | "turn";
@@ -47,7 +65,8 @@ type CatState = {
   hasSpawned: boolean;
 };
 
-const randomBetween = (min: number, max: number) => Math.random() * (max - min) + min;
+const randomBetween = (min: number, max: number) =>
+  Math.random() * (max - min) + min;
 
 // Tweak this constant to control horizontal movement amount.
 const CAT_MOVE_X_PX_PER_SEC = 120;
@@ -77,9 +96,17 @@ type FaqPayload = {
   items?: FaqItem[];
 };
 
+const getDocumentPageHeight = () => {
+  if (typeof document === "undefined") return 720;
+  return Math.max(
+    document.body.scrollHeight,
+    document.documentElement.scrollHeight
+  );
+};
+
 const getVisualScale = (viewportWidth: number) => {
   if (viewportWidth < 640) return 0.34;
-  if (viewportWidth < 1024) return 0.40;
+  if (viewportWidth < 1024) return 0.4;
   return 0.48;
 };
 
@@ -92,24 +119,32 @@ const getFramePosition = (frame: number) => {
   };
 };
 
-const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(value, max));
+const clamp = (value: number, min: number, max: number) =>
+  Math.max(min, Math.min(value, max));
 
 const getWalkSequence = (direction: Direction) => {
   return direction === "right" ? RIGHT_WALK_SEQUENCE : LEFT_WALK_SEQUENCE;
 };
 
 const getTurnSequence = (fromDirection: Direction) => {
-  return fromDirection === "right" ? TURN_RIGHT_TO_LEFT_SEQUENCE : TURN_LEFT_TO_RIGHT_SEQUENCE;
+  return fromDirection === "right"
+    ? TURN_RIGHT_TO_LEFT_SEQUENCE
+    : TURN_LEFT_TO_RIGHT_SEQUENCE;
 };
 
 const getNextTurnX = (x: number, direction: Direction, maxX: number) => {
-  const distance = randomBetween(TURN_POINT_MIN_DISTANCE, TURN_POINT_MAX_DISTANCE);
+  const distance = randomBetween(
+    TURN_POINT_MIN_DISTANCE,
+    TURN_POINT_MAX_DISTANCE
+  );
   const next = direction === "right" ? x + distance : x - distance;
   return clamp(next, 0, maxX);
 };
 
 const intersects = (a: Rect, b: Rect) => {
-  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  return (
+    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+  );
 };
 
 const makeBlackTransparent = (img: HTMLImageElement) => {
@@ -177,16 +212,19 @@ export function WanderingCat() {
     width: typeof window !== "undefined" ? window.innerWidth : 1280,
     height: typeof window !== "undefined" ? window.innerHeight : 720,
     scrollY: typeof window !== "undefined" ? window.scrollY : 0,
-    pageHeight: typeof document !== "undefined" ? Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) : 720,
-    scale: typeof window !== "undefined" ? getVisualScale(window.innerWidth) : 0.48,
+    pageHeight: getDocumentPageHeight(),
+    scale:
+      typeof window !== "undefined" ? getVisualScale(window.innerWidth) : 0.48,
   });
 
-  const activeFaq = faqItems.length > 0 ? faqItems[activeFaqIndex % faqItems.length] : null;
+  const activeFaq =
+    faqItems.length > 0 ? faqItems[activeFaqIndex % faqItems.length] : null;
 
   useEffect(() => {
     pausedRef.current = isPaused;
   }, [isPaused]);
-  // 吹き出しは猫と同じtransformで拡大縮小されるため、ローカル座標ではscaleを掛けない。
+
+  // The speech bubble is scaled together with the cat transform.
   const bubbleWidth = CHIP_WIDTH * 1.5;
 
   useEffect(() => {
@@ -230,7 +268,7 @@ export function WanderingCat() {
     if (faqItems.length <= 1 || isPaused) return;
 
     const timerId = window.setInterval(() => {
-      setActiveFaqIndex((prev) => (prev + 1) % faqItems.length);
+      setActiveFaqIndex(prev => (prev + 1) % faqItems.length);
     }, QUESTION_ROTATE_MS);
 
     return () => {
@@ -257,10 +295,19 @@ export function WanderingCat() {
 
   useEffect(() => {
     let retryId: number | null = null;
+    let isCancelled = false;
+
+    const clearRetry = () => {
+      if (retryId != null) {
+        window.clearInterval(retryId);
+        retryId = null;
+      }
+    };
 
     const tryLoadSprite = () => {
       const img = new Image();
       img.onload = () => {
+        if (isCancelled) return;
         const processed = makeBlackTransparent(img);
         if (processed) {
           setSpriteSrc(processed);
@@ -269,40 +316,49 @@ export function WanderingCat() {
         }
         setUseFallback(false);
         setIsReady(true);
+        clearRetry();
       };
       img.onerror = () => {
+        if (isCancelled) return;
         setUseFallback(true);
         setIsReady(true);
       };
-      img.src = `${SPRITE_URL}?t=${Date.now()}`;
+      img.src = SPRITE_URL;
     };
 
     tryLoadSprite();
 
-    // When the sprite file is added later during dev, auto-switch from fallback.
-    if (useFallback) {
+    // In dev, keep a lightweight retry loop so the sprite appears after adding the asset.
+    if (import.meta.env.DEV) {
       retryId = window.setInterval(tryLoadSprite, 2000);
     }
 
     return () => {
-      if (retryId != null) {
-        window.clearInterval(retryId);
-      }
+      isCancelled = true;
+      clearRetry();
     };
-  }, [useFallback]);
+  }, []);
 
   useEffect(() => {
     if (!isReady) return;
 
-    const handleResize = () => {
+    const syncViewport = () => {
       viewportRef.current.width = window.innerWidth;
       viewportRef.current.height = window.innerHeight;
       viewportRef.current.scrollY = window.scrollY;
-      viewportRef.current.pageHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+      viewportRef.current.pageHeight = getDocumentPageHeight();
       viewportRef.current.scale = getVisualScale(window.innerWidth);
+    };
 
-      const maxX = Math.max(0, viewportRef.current.width - CHIP_WIDTH * viewportRef.current.scale);
-      const maxY = Math.max(0, viewportRef.current.pageHeight - CHIP_HEIGHT * viewportRef.current.scale);
+    const clampStateToViewport = () => {
+      const maxX = Math.max(
+        0,
+        viewportRef.current.width - CHIP_WIDTH * viewportRef.current.scale
+      );
+      const maxY = Math.max(
+        0,
+        viewportRef.current.pageHeight - CHIP_HEIGHT * viewportRef.current.scale
+      );
       const state = stateRef.current;
 
       if (!state.hasSpawned) {
@@ -322,6 +378,20 @@ export function WanderingCat() {
       state.y = clamp(state.y, 0, maxY);
       state.targetY = clamp(state.targetY, 0, maxY);
       state.nextTurnX = clamp(state.nextTurnX, 0, maxX);
+    };
+
+    const handleResize = () => {
+      syncViewport();
+      clampStateToViewport();
+    };
+
+    const handleScroll = () => {
+      viewportRef.current.scrollY = window.scrollY;
+    };
+
+    const handleDocumentResize = () => {
+      viewportRef.current.pageHeight = getDocumentPageHeight();
+      clampStateToViewport();
     };
 
     const setVisual = () => {
@@ -350,14 +420,25 @@ export function WanderingCat() {
       const docLeft = rect.left;
       return {
         left: Math.max(0, docLeft - SEARCH_AVOID_PADDING),
-        right: Math.min(viewportRef.current.width, rect.right + SEARCH_AVOID_PADDING),
+        right: Math.min(
+          viewportRef.current.width,
+          rect.right + SEARCH_AVOID_PADDING
+        ),
         top: Math.max(0, docTop - SEARCH_AVOID_PADDING),
         bottom: docTop + rect.height + SEARCH_AVOID_PADDING,
       };
     };
 
     handleResize();
-    window.addEventListener("resize", handleResize);
+    window.addEventListener("resize", handleResize, { passive: true });
+    window.addEventListener("scroll", handleScroll, { passive: true });
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(handleDocumentResize);
+      resizeObserver.observe(document.body);
+      resizeObserver.observe(document.documentElement);
+    }
 
     const tick = (time: number) => {
       if (lastTimeRef.current == null) {
@@ -378,14 +459,15 @@ export function WanderingCat() {
       }
 
       viewportRef.current.scrollY = window.scrollY;
-      viewportRef.current.pageHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
       const scaledWidth = CHIP_WIDTH * viewportRef.current.scale;
       const scaledHeight = CHIP_HEIGHT * viewportRef.current.scale;
       const maxX = Math.max(0, viewportRef.current.width - scaledWidth);
       const maxY = Math.max(0, viewportRef.current.pageHeight - scaledHeight);
       const viewportTop = viewportRef.current.scrollY;
       const viewportBottom = viewportTop + viewportRef.current.height;
-      const isOffscreen = state.y + scaledHeight < viewportTop - 24 || state.y > viewportBottom + 24;
+      const isOffscreen =
+        state.y + scaledHeight < viewportTop - 24 ||
+        state.y > viewportBottom + 24;
       const moveMultiplier = isOffscreen ? CAT_SPRINT_MULTIPLIER : 1;
       const avoidRect = resolveSearchAvoidRect();
 
@@ -432,7 +514,9 @@ export function WanderingCat() {
           };
 
           if (intersects(catRect, avoidRect)) {
-            const moveUp = Math.abs(catRect.bottom - avoidRect.top) < Math.abs(avoidRect.bottom - catRect.top);
+            const moveUp =
+              Math.abs(catRect.bottom - avoidRect.top) <
+              Math.abs(avoidRect.bottom - catRect.top);
             state.y = moveUp
               ? clamp(avoidRect.top - scaledHeight - 6, 0, maxY)
               : clamp(avoidRect.bottom + 6, 0, maxY);
@@ -463,7 +547,14 @@ export function WanderingCat() {
         }
 
         if (isOffscreen) {
-          state.targetY = clamp(randomBetween(viewportTop + viewportRef.current.height * 0.2, viewportBottom - viewportRef.current.height * 0.2), 0, maxY);
+          state.targetY = clamp(
+            randomBetween(
+              viewportTop + viewportRef.current.height * 0.2,
+              viewportBottom - viewportRef.current.height * 0.2
+            ),
+            0,
+            maxY
+          );
           state.mode = "walk";
         }
 
@@ -523,6 +614,8 @@ export function WanderingCat() {
 
     return () => {
       window.removeEventListener("resize", handleResize);
+      window.removeEventListener("scroll", handleScroll);
+      resizeObserver?.disconnect();
       if (rafIdRef.current != null) {
         window.cancelAnimationFrame(rafIdRef.current);
       }
@@ -545,25 +638,32 @@ export function WanderingCat() {
 
   const showNextFaq = () => {
     if (faqItems.length <= 1) return;
-    setActiveFaqIndex((prev) => (prev + 1) % faqItems.length);
+    setActiveFaqIndex(prev => (prev + 1) % faqItems.length);
   };
 
   return (
     <>
-      <div className="pointer-events-none fixed inset-0 z-40 overflow-hidden" aria-hidden={isQaOpen}>
+      <div
+        className="pointer-events-none fixed inset-0 z-40 overflow-hidden"
+        aria-hidden={isQaOpen}
+      >
         <div
           ref={catRef}
           role="button"
           tabIndex={0}
           aria-label="猫のQ&Aを開く"
           onClick={openQa}
-          onKeyDown={(event) => {
+          onKeyDown={event => {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
               openQa();
             }
           }}
-          className={useFallback ? "wandering-cat-sprite wandering-cat-sprite--fallback" : "wandering-cat-sprite"}
+          className={
+            useFallback
+              ? "wandering-cat-sprite wandering-cat-sprite--fallback"
+              : "wandering-cat-sprite"
+          }
           style={{
             position: "absolute",
             left: 0,
@@ -591,8 +691,8 @@ export function WanderingCat() {
                 bottom: "calc(100% + 0.5em)",
                 left: "50%",
                 transform: "translateX(-50%)",
-                  width: `${bubbleWidth}px`,
-                  boxSizing: "border-box",
+                width: `${bubbleWidth}px`,
+                boxSizing: "border-box",
                 borderRadius: "20px",
                 border: "2px solid rgb(22 22 22 / 95%)",
                 background: "rgb(255 255 255 / 96%)",
@@ -630,17 +730,29 @@ export function WanderingCat() {
         >
           <section
             className="w-full max-w-3xl rounded-2xl border-2 border-black bg-white p-5 shadow-[6px_6px_0_0_rgba(0,0,0,0.8)] sm:p-6"
-            onClick={(event) => event.stopPropagation()}
+            onClick={event => event.stopPropagation()}
           >
-            <p className="text-lg font-bold uppercase tracking-wide text-muted-foreground">Cat Q&A</p>
-            <h2 className="mt-1 text-4xl font-extrabold leading-tight">質問 {activeFaq.id}</h2>
+            <p className="text-lg font-bold uppercase tracking-wide text-muted-foreground">
+              Cat Q&A
+            </p>
+            <h2 className="mt-1 text-4xl font-extrabold leading-tight">
+              質問 {activeFaq.id}
+            </h2>
             <div className="mt-4 rounded-xl bg-muted p-4">
-              <p className="text-lg font-bold uppercase tracking-wide text-muted-foreground">Q</p>
-              <p className="mt-1 text-[1.8rem] font-semibold leading-relaxed">{activeFaq.question}</p>
+              <p className="text-lg font-bold uppercase tracking-wide text-muted-foreground">
+                Q
+              </p>
+              <p className="mt-1 text-[1.8rem] font-semibold leading-relaxed">
+                {activeFaq.question}
+              </p>
             </div>
             <div className="mt-3 rounded-xl border border-border p-4">
-              <p className="text-lg font-bold uppercase tracking-wide text-muted-foreground">A</p>
-              <p className="mt-1 text-[1.55rem] leading-relaxed text-foreground">{activeFaq.answer}</p>
+              <p className="text-lg font-bold uppercase tracking-wide text-muted-foreground">
+                A
+              </p>
+              <p className="mt-1 text-[1.55rem] leading-relaxed text-foreground">
+                {activeFaq.answer}
+              </p>
             </div>
             <div className="mt-5 flex flex-wrap gap-2">
               <button
