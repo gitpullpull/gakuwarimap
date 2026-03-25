@@ -533,33 +533,54 @@ function isBeautySalon(shop: AgentShop): boolean {
   );
 }
 
+function isKaraoke(shop: AgentShop): boolean {
+  const types = shop.types ?? [];
+  if (types.some((t) => t.toLowerCase().includes("karaoke"))) return true;
+  return /カラオケ|まねきねこ|ビッグエコー|ジャンカラ|コート・ダジュール|シダックス/i.test(
+    shop.name
+  );
+}
+
+/**
+ * ブランチ名（例: "京橋店"）を除いたチェーン名を返す。
+ * "カラオケまねきねこ 京橋店" → "まねきねこ"
+ * "ビッグエコー 渋谷店"      → "ビッグエコー"
+ */
+function extractChainName(name: string): string {
+  // 末尾の「XX店」「XX号店」などを除去
+  const stripped = name.replace(/\s+\S*[店号館舗]\s*$/, "").trim();
+  // 先頭のカテゴリ語（"カラオケ"など、スペースなしでも除去）を除去
+  const withoutPrefix = stripped
+    .replace(/^(カラオケ|美容室|理容室|ヘアサロン)\s*/, "")
+    .trim();
+  return withoutPrefix.length >= 2 ? withoutPrefix : name;
+}
+
 function buildEvidenceSearchQuery(shop: AgentShop): string {
+  const chainName = extractChainName(shop.name);
   const host = getWebsiteHost(shop.website);
 
-  const searchTerms = ["学割", "学生割引", "学生"];
+  const searchTerms = ["学割", "学生"];
+
   if (isBeautySalon(shop)) {
     searchTerms.push(
       "学生カット",
       "学割U24",
       "U24",
-      "学生限定",
       "高校生",
       "大学生",
       "ホットペッパー",
       "minimo"
     );
+    if (host) searchTerms.push(host);
+  } else if (isKaraoke(shop)) {
+    searchTerms.push("学割フリータイム", "学生フリータイム", "学生限定");
+  } else {
+    searchTerms.push("学生割引");
+    if (host) searchTerms.push(host);
   }
 
-  if (host) {
-    searchTerms.push(host);
-  }
-
-  const addressHint =
-    typeof shop.address === "string" && shop.address.trim().length > 0
-      ? ` ${shop.address.trim().slice(0, 40)}`
-      : "";
-
-  return `"${shop.name}"${addressHint} ${searchTerms.join(" ")}`;
+  return `${chainName} ${searchTerms.join(" ")}`;
 }
 
 function buildEvidenceReviewMessage(
