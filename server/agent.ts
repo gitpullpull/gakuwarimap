@@ -292,7 +292,7 @@ const MAX_PREFERRED_SPECIALTY_PROFILES = 2;
 const MAX_BROAD_NEXT_PAGES = 1;
 const MAX_SEARCH_RESULTS_PER_QUERY = 4;
 const MAX_EVIDENCE_SNIPPETS = 6;
-const MAX_EVIDENCE_QUERIES = 2;
+const MAX_EVIDENCE_QUERIES = 3;
 const WAVE_ONE_SIZE = 8;
 const WAVE_TWO_SIZE = 8;
 const MAX_INVESTIGATED_AFTER_HIT = 12;
@@ -1102,6 +1102,10 @@ function getCachedAgentResult(
   cacheKey: string,
   shop: AgentShop
 ): AgentResultItem | null {
+  if (process.env.DISABLE_AGENT_CACHE === "true") {
+    return null;
+  }
+
   const cached = agentResultCache.get(cacheKey);
 
   if (!cached) {
@@ -1150,6 +1154,10 @@ function getCandidateSearchCacheKey(context: SearchContext): string {
 }
 
 function getCachedCandidateSearch(cacheKey: string): RankedCandidate[] | null {
+  if (process.env.DISABLE_AGENT_CACHE === "true") {
+    return null;
+  }
+
   const cached = candidateSearchCache.get(cacheKey);
 
   if (!cached) {
@@ -2145,6 +2153,10 @@ export function buildEvidenceSearchQueries(
     `"${shop.name}"${addressHint} ${categoryTerms.join(" ")} ${
       optionalUserKeyword ?? ""
     }`.trim(),
+    // チェーン店向け: クォートなし・住所なし — チェーン全体の料金ページを拾う
+    `${shop.name} ${categoryTerms.slice(0, 3).join(" ")} ${
+      optionalUserKeyword ?? ""
+    }`.trim(),
   ].filter((query): query is string => Boolean(query));
 
   return queries
@@ -2481,7 +2493,7 @@ function shouldReviewOutcome(outcome: InvestigationOutcome): boolean {
     outcome.verifierCompleted &&
     !outcome.result.has_gakuwari &&
     outcome.result.confidence === "low" &&
-    outcome.rank <= 4 &&
+    outcome.rank <= 8 &&
     outcome.evidence.snippets.length > 0 &&
     hasPositiveReviewerSignal(outcome.evidence)
   );
