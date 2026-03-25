@@ -91,6 +91,11 @@ let nextCategoryId = 100;
 let nextSpotId = 1000;
 let nextReviewId = 5000;
 
+function getDiscountRatePercentValue(discountRate: string | null): number | null {
+  const match = discountRate?.match(/(\d+(?:\.\d+)?)%/);
+  return match ? Number(match[1]) : null;
+}
+
 function createPublicContext(): TrpcContext {
   return {
     user: null,
@@ -210,6 +215,69 @@ beforeEach(() => {
       createdAt: new Date("2024-02-01T00:00:00.000Z"),
       updatedAt: new Date("2024-02-01T00:00:00.000Z"),
     },
+    {
+      id: 103,
+      name: "蜑榊燕蟄ｦ蜑ｲ繝倥い繧ｵ繝ｭ繝ｳ",
+      description: "30%OFF の学割ヘアサロン",
+      address: "譚ｱ莠ｬ驛ｽ豐ｳ豕輔∈繝ｫ3-3-3",
+      lat: 35.6712,
+      lng: 139.764,
+      categoryId: 8,
+      discountDetail: "学生証提示で30%OFF",
+      discountRate: "30%OFF",
+      phone: null,
+      website: "https://example.com/salon",
+      openingHours: null,
+      imageUrl: null,
+      avgRating: 4.1,
+      reviewCount: 0,
+      isVerified: true,
+      submittedBy: null,
+      createdAt: new Date("2024-03-01T00:00:00.000Z"),
+      updatedAt: new Date("2024-03-01T00:00:00.000Z"),
+    },
+    {
+      id: 104,
+      name: "蟄ｦ蜑ｲ譏逕ｻ鬢ｨ",
+      description: "20%OFF の映画館",
+      address: "譚ｱ莠ｬ驛ｽ譁ｰ螳ｿ蛹ｺ譏逕ｻ4-4-4",
+      lat: 35.6945,
+      lng: 139.7013,
+      categoryId: 3,
+      discountDetail: "学生料金で20%OFF",
+      discountRate: "20%OFF",
+      phone: null,
+      website: "https://example.com/cinema",
+      openingHours: null,
+      imageUrl: null,
+      avgRating: 4.8,
+      reviewCount: 0,
+      isVerified: true,
+      submittedBy: null,
+      createdAt: new Date("2024-04-01T00:00:00.000Z"),
+      updatedAt: new Date("2024-04-01T00:00:00.000Z"),
+    },
+    {
+      id: 105,
+      name: "蟄ｦ蜑ｲ繝ｩ繝ｼ繝｡繝ｳ",
+      description: "無料トッピングの学割ラーメン",
+      address: "譚ｱ莠ｬ驛ｽ荳臥伐蛹ｺ5-5-5",
+      lat: 35.6487,
+      lng: 139.7414,
+      categoryId: 6,
+      discountDetail: "学生証提示でトッピング無料",
+      discountRate: "トッピング無料",
+      phone: null,
+      website: "https://example.com/ramen",
+      openingHours: null,
+      imageUrl: null,
+      avgRating: 4.4,
+      reviewCount: 0,
+      isVerified: true,
+      submittedBy: null,
+      createdAt: new Date("2024-05-01T00:00:00.000Z"),
+      updatedAt: new Date("2024-05-01T00:00:00.000Z"),
+    },
   ];
 
   reviewsState = [
@@ -267,6 +335,29 @@ beforeEach(() => {
     switch (opts.sortBy) {
       case "rating":
         items.sort((a, b) => Number(b.avgRating ?? 0) - Number(a.avgRating ?? 0));
+        break;
+      case "discountRate":
+        items.sort((a, b) => {
+          const leftPercent = getDiscountRatePercentValue(a.discountRate);
+          const rightPercent = getDiscountRatePercentValue(b.discountRate);
+
+          if (leftPercent !== null && rightPercent === null) return -1;
+          if (leftPercent === null && rightPercent !== null) return 1;
+          if (
+            leftPercent !== null &&
+            rightPercent !== null &&
+            rightPercent !== leftPercent
+          ) {
+            return rightPercent - leftPercent;
+          }
+
+          const ratingDiff = Number(b.avgRating ?? 0) - Number(a.avgRating ?? 0);
+          if (ratingDiff !== 0) {
+            return ratingDiff;
+          }
+
+          return b.createdAt.getTime() - a.createdAt.getTime();
+        });
         break;
       case "name":
         items.sort((a, b) => a.name.localeCompare(b.name, "ja"));
@@ -425,6 +516,22 @@ describe("spot.list", () => {
     for (let index = 1; index < ratings.length; index += 1) {
       expect(ratings[index]).toBeLessThanOrEqual(ratings[index - 1]);
     }
+  });
+
+  it("accepts discountRate sorting and keeps percent discounts first", async () => {
+    const ctx = createPublicContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.spot.list({ sortBy: "discountRate", limit: 50 });
+    const orderedDiscountRates = result.items.map((item) => item.discountRate);
+
+    expect(orderedDiscountRates.slice(0, 5)).toEqual([
+      "30%OFF",
+      "20%OFF",
+      "10%OFF",
+      "トッピング無料",
+      "50円引き",
+    ]);
   });
 });
 

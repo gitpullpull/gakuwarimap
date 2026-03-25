@@ -1,4 +1,4 @@
-import { eq, desc, asc, sql, and, like } from "drizzle-orm";
+import { eq, desc, asc, sql, and } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   InsertUser, users,
@@ -99,7 +99,7 @@ export async function getSpots(opts: {
   search?: string;
   limit?: number;
   offset?: number;
-  sortBy?: "rating" | "newest" | "name";
+  sortBy?: "rating" | "newest" | "name" | "discountRate";
 }) {
   const db = await getDb();
   if (!db) return { items: [], total: 0 };
@@ -115,23 +115,42 @@ export async function getSpots(opts: {
   }
 
   const where = conditions.length > 0 ? and(...conditions) : undefined;
+  const discountPercentPattern = String.raw`[0-9]+(\.[0-9]+)?%`;
+  const discountNumberPattern = String.raw`[0-9]+(\.[0-9]+)?`;
+  const baseItemsQuery = db
+    .select()
+    .from(spots)
+    .where(where)
+    .limit(opts.limit ?? 20)
+    .offset(opts.offset ?? 0);
 
-  let orderBy;
+  let itemsQuery = baseItemsQuery.orderBy(desc(spots.createdAt));
   switch (opts.sortBy) {
     case "rating":
-      orderBy = desc(spots.avgRating);
+      itemsQuery = baseItemsQuery.orderBy(desc(spots.avgRating));
+      break;
+    case "discountRate":
+      itemsQuery = baseItemsQuery.orderBy(
+        sql`CASE WHEN ${spots.discountRate} REGEXP ${discountPercentPattern} THEN 0 ELSE 1 END`,
+        sql`CASE WHEN ${spots.discountRate} REGEXP ${discountPercentPattern}
+          THEN CAST(REGEXP_SUBSTR(${spots.discountRate}, ${discountNumberPattern}) AS DECIMAL(10, 2))
+          ELSE NULL
+        END DESC`,
+        desc(spots.avgRating),
+        desc(spots.createdAt)
+      );
       break;
     case "name":
-      orderBy = asc(spots.name);
+      itemsQuery = baseItemsQuery.orderBy(asc(spots.name));
       break;
     case "newest":
     default:
-      orderBy = desc(spots.createdAt);
+      itemsQuery = baseItemsQuery.orderBy(desc(spots.createdAt));
       break;
   }
 
   const [items, countResult] = await Promise.all([
-    db.select().from(spots).where(where).orderBy(orderBy).limit(opts.limit ?? 20).offset(opts.offset ?? 0),
+    itemsQuery,
     db.select({ count: sql<number>`count(*)` }).from(spots).where(where),
   ]);
 

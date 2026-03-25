@@ -1,11 +1,24 @@
-import { useState, useMemo, useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSearch } from "wouter";
 import { trpc } from "@/lib/trpc";
+import {
+  buildSpotSearchQueryInput,
+  isSpotSortBy,
+  SPOT_SORT_OPTIONS,
+  type SpotSortBy,
+} from "@/lib/spotSort";
 import { SpotCard } from "@/components/SpotCard";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Search, MapPin, X } from "lucide-react";
+import { MapPin, Search, SlidersHorizontal, X } from "lucide-react";
 
 export default function SearchPage() {
   const searchString = useSearch();
@@ -14,12 +27,17 @@ export default function SearchPage() {
 
   const [query, setQuery] = useState(initialQuery);
   const [searchTerm, setSearchTerm] = useState(initialQuery);
+  const [sortBy, setSortBy] = useState<SpotSortBy>("newest");
 
   const { data: categoriesData } = trpc.category.list.useQuery();
   const categories = categoriesData ?? [];
 
   const { data, isLoading } = trpc.spot.list.useQuery(
-    { search: searchTerm, limit: 50 },
+    buildSpotSearchQueryInput({
+      searchTerm,
+      sortBy,
+      limit: 50,
+    }),
     { enabled: searchTerm.length > 0 }
   );
 
@@ -27,7 +45,7 @@ export default function SearchPage() {
 
   const categoryMap = useMemo(() => {
     const map = new Map<number, (typeof categories)[0]>();
-    categories.forEach((c) => map.set(c.id, c));
+    categories.forEach((category) => map.set(category.id, category));
     return map;
   }, [categories]);
 
@@ -36,66 +54,99 @@ export default function SearchPage() {
     setSearchTerm(initialQuery);
   }, [initialQuery]);
 
-  const handleSearch = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSearch = (event: React.FormEvent) => {
+    event.preventDefault();
     setSearchTerm(query.trim());
   };
 
   return (
     <div className="min-h-screen pb-20 md:pb-8">
       <div className="container py-6">
-        <h1 className="text-2xl sm:text-3xl font-black uppercase tracking-tight mb-6">検索</h1>
+        <h1 className="mb-6 text-2xl font-black uppercase tracking-tight sm:text-3xl">
+          検索
+        </h1>
 
-        {/* Search form */}
-        <form onSubmit={handleSearch} className="flex gap-2 mb-6">
+        <form onSubmit={handleSearch} className="mb-4 flex gap-2">
           <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" size={18} />
+            <Search
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+              size={18}
+            />
             <Input
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="店名・エリア・学割内容で検索..."
-              className="pl-10 h-12 border-2 border-foreground rounded-xl text-base shadow-[3px_3px_0px_oklch(0.15_0.01_0)]"
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="駅名・エリア・学割内容で検索..."
+              className="h-12 rounded-xl border-2 border-foreground pl-10 text-base shadow-[3px_3px_0px_oklch(0.15_0.01_0)]"
             />
             {query && (
               <button
                 type="button"
-                onClick={() => { setQuery(""); setSearchTerm(""); }}
+                onClick={() => {
+                  setQuery("");
+                  setSearchTerm("");
+                }}
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
               >
                 <X size={18} />
               </button>
             )}
           </div>
-          <Button type="submit" className="memphis-btn h-12 px-5 rounded-xl bg-primary text-primary-foreground">
+          <Button
+            type="submit"
+            className="memphis-btn h-12 rounded-xl bg-primary px-5 text-primary-foreground"
+          >
             <Search size={18} />
           </Button>
         </form>
 
-        {/* Results */}
+        <div className="mb-6 flex items-center gap-2">
+          <SlidersHorizontal size={16} className="text-muted-foreground" />
+          <Select
+            value={sortBy}
+            onValueChange={(value) => {
+              if (!isSpotSortBy(value)) return;
+              setSortBy(value);
+            }}
+          >
+            <SelectTrigger className="h-9 w-[170px] rounded-lg border-2 border-foreground text-xs font-bold shadow-[2px_2px_0px_oklch(0.15_0.01_0)]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {SPOT_SORT_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
         {!searchTerm ? (
-          <div className="text-center py-16">
-            <Search size={48} className="mx-auto text-muted-foreground/20 mb-3" />
-            <p className="text-muted-foreground font-medium">キーワードを入力して検索してください</p>
+          <div className="py-16 text-center">
+            <Search size={48} className="mx-auto mb-3 text-muted-foreground/20" />
+            <p className="font-medium text-muted-foreground">
+              キーワードを入力して検索してください
+            </p>
           </div>
         ) : isLoading ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <Skeleton key={i} className="h-64 rounded-xl" />
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {Array.from({ length: 6 }).map((_, index) => (
+              <Skeleton key={index} className="h-64 rounded-xl" />
             ))}
           </div>
         ) : spots.length === 0 ? (
-          <div className="text-center py-16 bg-card rounded-xl border-2 border-foreground shadow-[4px_4px_0px_oklch(0.15_0.01_0)]">
-            <MapPin size={48} className="mx-auto text-muted-foreground/30 mb-3" />
-            <p className="text-muted-foreground font-medium">
+          <div className="rounded-xl border-2 border-foreground bg-card py-16 text-center shadow-[4px_4px_0px_oklch(0.15_0.01_0)]">
+            <MapPin size={48} className="mx-auto mb-3 text-muted-foreground/30" />
+            <p className="font-medium text-muted-foreground">
               「{searchTerm}」に一致するスポットが見つかりません
             </p>
           </div>
         ) : (
           <>
-            <p className="text-sm text-muted-foreground mb-4 font-semibold">
+            <p className="mb-4 text-sm font-semibold text-muted-foreground">
               「{searchTerm}」の検索結果: {spots.length}件
             </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {spots.map((spot) => (
                 <SpotCard
                   key={spot.id}

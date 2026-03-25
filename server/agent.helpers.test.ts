@@ -3,6 +3,7 @@ import {
   collectCandidateShops,
   getAgentCacheKeyForPlace,
   parseAgentResultContent,
+  resetAgentCaches,
   searchNearbyPlaces,
 } from "./agent";
 import { makeRequest } from "./_core/map";
@@ -56,6 +57,7 @@ beforeEach(() => {
 
 afterEach(() => {
   process.env = { ...ORIGINAL_ENV };
+  resetAgentCaches();
   vi.resetAllMocks();
 });
 
@@ -243,12 +245,114 @@ describe("collectCandidateShops", () => {
       )
     ).toBe(true);
   });
+
+  it("retries INVALID_REQUEST pagination three times before aborting the profile", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockedMakeRequest.mockImplementation(async (endpoint, params) => {
+      if (endpoint !== "/maps/api/place/nearbysearch/json") {
+        throw new Error(`Unexpected endpoint: ${String(endpoint)}`);
+      }
+
+      const request = params as Record<string, unknown>;
+      if (String(request.pagetoken ?? "") === "broad-page-2") {
+        return {
+          status: "INVALID_REQUEST",
+          results: [],
+        } as never;
+      }
+
+      return {
+        status: "OK",
+        next_page_token: "broad-page-2",
+        results: [
+          createPlace("Cafe Nearby", 35.6596, 139.7004, {
+            placeId: "cafe-nearby",
+            type: "cafe",
+          }),
+        ],
+      } as never;
+    });
+
+    const candidates = await collectCandidateShops(35.6595, 139.7005, 500);
+    const paginationCalls = mockedMakeRequest.mock.calls.filter(
+      ([, params]) => (params as Record<string, unknown>).pagetoken === "broad-page-2"
+    );
+    const diagnosticLines = [
+      ...logSpy.mock.calls.flat().map((value) => String(value)),
+      ...warnSpy.mock.calls.flat().map((value) => String(value)),
+      ...errorSpy.mock.calls.flat().map((value) => String(value)),
+    ];
+
+    expect(candidates.map((candidate) => candidate.place_id)).toContain("cafe-nearby");
+    expect(paginationCalls).toHaveLength(3);
+    expect(
+      diagnosticLines.some(
+        (line) =>
+          line.includes('"stage":"pagination"') &&
+          line.includes('"action":"retry"') &&
+          line.includes('"attempt":1')
+      )
+    ).toBe(true);
+    expect(
+      diagnosticLines.some(
+        (line) =>
+          line.includes('"stage":"pagination"') &&
+          line.includes('"action":"abort_profile"') &&
+          line.includes('"attempt":3')
+      )
+    ).toBe(true);
+  });
+
+  it("continues with the broad profile when a specialty first page fails", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockedMakeRequest.mockImplementation(async (endpoint, params) => {
+      if (endpoint !== "/maps/api/place/nearbysearch/json") {
+        throw new Error(`Unexpected endpoint: ${String(endpoint)}`);
+      }
+
+      const request = params as Record<string, unknown>;
+      const type = String(request.type ?? "");
+      if (type === "movie_theater") {
+        return {
+          status: "INVALID_REQUEST",
+          results: [],
+        } as never;
+      }
+
+      return {
+        status: "OK",
+        results: [
+          createPlace("Cafe Nearby", 35.6596, 139.7004, {
+            placeId: "cafe-nearby",
+            type: "cafe",
+          }),
+        ],
+      } as never;
+    });
+
+    const candidates = await collectCandidateShops(35.6595, 139.7005, 500, "movie");
+
+    expect(candidates.map((candidate) => candidate.place_id)).toEqual(["cafe-nearby"]);
+    expect(
+      errorSpy.mock.calls
+        .flat()
+        .map((value) => String(value))
+        .some(
+          (line) =>
+            line.includes('"stage":"candidate_search"') &&
+            line.includes('"action":"abort_profile"') &&
+            line.includes('"profileId":"movie_theater"')
+        )
+    ).toBe(true);
+  });
 });
 
 describe("getAgentCacheKeyForPlace", () => {
   it("includes the strategy version prefix", () => {
     expect(getAgentCacheKeyForPlace("place_123")).toBe(
-      "agent-team-v1::place_123"
+      "agent-team-v2::place_123"
     );
   });
 });

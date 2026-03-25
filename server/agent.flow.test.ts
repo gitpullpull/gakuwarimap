@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { searchGakuwariSpots } from "./agent";
+import { resetAgentCaches, searchGakuwariSpots } from "./agent";
 import { makeRequest } from "./_core/map";
 
 vi.mock("./_core/map", () => ({
@@ -14,6 +14,12 @@ type ShopSpec = {
   reviewerContent?: string;
   searchContent?: string;
   searchUrl?: string;
+  searchStatus?: number;
+  searchResults?: Array<{
+    title?: string;
+    url?: string;
+    description?: string;
+  }>;
 };
 
 function createPlace(
@@ -84,17 +90,19 @@ function createPlacesMock({
   nextPageResults = [],
   typeResults = {},
   detailsById = {},
+  detailsStatusById = {},
 }: {
   broadResults: Array<ReturnType<typeof createPlace>>;
   nextPageResults?: Array<ReturnType<typeof createPlace>>;
   typeResults?: Record<string, Array<ReturnType<typeof createPlace>>>;
   detailsById?: Record<string, { website?: string; formatted_address?: string }>;
+  detailsStatusById?: Record<string, string>;
 }) {
   return async (endpoint: string, params: Record<string, unknown>) => {
     if (endpoint === "/maps/api/place/details/json") {
       const placeId = String(params.place_id ?? "");
       return {
-        status: "OK",
+        status: detailsStatusById[placeId] ?? "OK",
         result: detailsById[placeId] ?? {},
       } as never;
     }
@@ -160,20 +168,34 @@ function createFetchMock(specs: Record<string, ShopSpec>) {
         },
       ];
 
+      if (spec.searchStatus && spec.searchStatus !== 200) {
+        return new Response(
+          JSON.stringify({ error: `Search failed for ${name}` }),
+          {
+            status: spec.searchStatus,
+            headers: {
+              "content-type": "application/json",
+            },
+          }
+        );
+      }
+
       return new Response(
         JSON.stringify({
           web: {
-            results: [
-              {
-                title: name,
-                url: spec.searchUrl ?? `https://example.com/${encodeURIComponent(name)}`,
-                description: spec.searchContent ?? "No student discount found",
-              },
-            ],
+            results:
+              spec.searchResults ??
+              [
+                {
+                  title: name,
+                  url: spec.searchUrl ?? `https://example.com/${encodeURIComponent(name)}`,
+                  description: spec.searchContent ?? "No student discount found",
+                },
+              ],
           },
         }),
         {
-          status: 200,
+          status: spec.searchStatus ?? 200,
           headers: {
             "content-type": "application/json",
           },
@@ -239,6 +261,7 @@ beforeEach(() => {
 
 afterEach(() => {
   process.env = { ...ORIGINAL_ENV };
+  resetAgentCaches();
   vi.resetAllMocks();
   vi.unstubAllGlobals();
 });
@@ -298,6 +321,263 @@ describe("searchGakuwariSpots", () => {
     );
   });
 
+  it("halts a candidate after a non-retryable Brave failure and skips Gemini", async () => {
+    const broadResults = [
+      createPlace("Cafe Fail", 35.1, 139.1, {
+        placeId: "place_fail",
+        type: "cafe",
+        address: "Tokyo Fail",
+      }),
+    ];
+
+    mockedMakeRequest.mockImplementation(
+      createPlacesMock({
+        broadResults,
+        detailsById: {
+          place_fail: {
+            website: "https://fail.example.com",
+            formatted_address: "Tokyo Fail",
+          },
+        },
+      })
+    );
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/search?")) {
+        return new Response(JSON.stringify({ error: "Search failed for Cafe Fail" }), {
+          status: 422,
+          headers: {
+            "content-type": "application/json",
+          },
+        });
+      }
+      if (url.includes("/chat/completions")) {
+        throw new Error("Gemini should not be called for Cafe Fail");
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal("fetch", fetchMock);
+
+    const results = await searchGakuwariSpots(35.1, 139.1, 500, "cafe");
+    const searchCalls = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes("/search?")
+    );
+    const chatCalls = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes("/chat/completions")
+    );
+    const diagnosticLines = [
+      ...logSpy.mock.calls.flat().map((value) => String(value)),
+      ...warnSpy.mock.calls.flat().map((value) => String(value)),
+      ...errorSpy.mock.calls.flat().map((value) => String(value)),
+    ];
+
+    expect(results[0]).toMatchObject({
+      place_id: "place_fail",
+      has_gakuwari: false,
+      confidence: "low",
+    });
+    expect(searchCalls).toHaveLength(1);
+    expect(chatCalls).toHaveLength(0);
+    expect(
+      diagnosticLines.some(
+        (line) =>
+          line.includes('"stage":"retriever"') &&
+          line.includes('"provider":"brave"') &&
+          line.includes('"action":"abort_candidate"') &&
+          line.includes('"httpStatus":422')
+      )
+    ).toBe(true);
+    expect(
+      diagnosticLines.some(
+        (line) =>
+          line.includes('"event":"candidate_halt"') &&
+          line.includes('"haltReason":"brave_request_failed"')
+      )
+    ).toBe(true);
+    expect(
+      diagnosticLines.some(
+        (line) =>
+          line.includes('"event":"search_summary"') &&
+          line.includes('"brave":{"attempted":1') &&
+          line.includes('"gemini":{"attempted":0')
+      )
+    ).toBe(true);
+  });
+
+  it("skips Gemini when Brave succeeds but returns no evidence snippets", async () => {
+    const broadResults = [
+      createPlace("Cafe Empty", 35.1, 139.1, {
+        placeId: "place_empty",
+        type: "cafe",
+        address: "Tokyo Empty",
+      }),
+    ];
+
+    mockedMakeRequest.mockImplementation(
+      createPlacesMock({
+        broadResults,
+        detailsById: {
+          place_empty: {
+            website: "https://empty.example.com",
+            formatted_address: "Tokyo Empty",
+          },
+        },
+      })
+    );
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/search?")) {
+        return new Response(
+          JSON.stringify({
+            web: {
+              results: [],
+            },
+          }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+            },
+          }
+        );
+      }
+      if (url.includes("/chat/completions")) {
+        throw new Error("Gemini should not be called for Cafe Empty");
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubGlobal("fetch", fetchMock);
+
+    const results = await searchGakuwariSpots(35.1, 139.1, 500, "cafe");
+    const searchCalls = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes("/search?")
+    );
+    const chatCalls = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes("/chat/completions")
+    );
+
+    expect(results[0]).toMatchObject({
+      place_id: "place_empty",
+      has_gakuwari: false,
+      confidence: "low",
+    });
+    expect(searchCalls).toHaveLength(2);
+    expect(chatCalls).toHaveLength(0);
+    expect(
+      warnSpy.mock.calls
+        .flat()
+        .map((value) => String(value))
+        .some(
+          (line) =>
+            line.includes('"event":"candidate_halt"') &&
+            line.includes('"haltReason":"brave_no_evidence"')
+        )
+    ).toBe(true);
+  });
+
+  it("continues to Brave and Gemini when place details fail but the nearby address is usable", async () => {
+    const broadResults = [
+      createPlace("Cafe Fallback", 35.1, 139.1, {
+        placeId: "place_fallback",
+        type: "cafe",
+        address: "Usable Nearby Address",
+      }),
+    ];
+
+    mockedMakeRequest.mockImplementation(
+      createPlacesMock({
+        broadResults,
+        detailsById: {},
+        detailsStatusById: {
+          place_fallback: "ZERO_RESULTS",
+        },
+      })
+    );
+
+    const fetchMock = createFetchMock({
+      "Cafe Fallback": {
+        verifierContent:
+          '{"has_gakuwari":true,"discount_info":"5% off","source_url":"https://example.com/fallback","confidence":"medium"}',
+        searchContent: "Student discount available",
+        searchUrl: "https://example.com/fallback",
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const results = await searchGakuwariSpots(35.1, 139.1, 500, "cafe");
+
+    expect(results[0]).toMatchObject({
+      place_id: "place_fallback",
+      has_gakuwari: true,
+      confidence: "medium",
+    });
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("/search?"))
+    ).toHaveLength(2);
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("/chat/completions"))
+    ).toHaveLength(1);
+  });
+
+  it("halts a candidate before Brave when details fail and no usable address or website remain", async () => {
+    const broadResults = [
+      createPlace("Cafe No Context", 35.1, 139.1, {
+        placeId: "place_no_context",
+        type: "cafe",
+        address: "",
+      }),
+    ];
+
+    mockedMakeRequest.mockImplementation(
+      createPlacesMock({
+        broadResults,
+        detailsById: {},
+        detailsStatusById: {
+          place_no_context: "ZERO_RESULTS",
+        },
+      })
+    );
+
+    const fetchMock = createFetchMock({
+      "Cafe No Context": {
+        verifierContent:
+          '{"has_gakuwari":true,"discount_info":"should not appear","source_url":"https://example.com/unused","confidence":"high"}',
+      },
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubGlobal("fetch", fetchMock);
+
+    const results = await searchGakuwariSpots(35.1, 139.1, 500, "cafe");
+
+    expect(results[0]).toMatchObject({
+      place_id: "place_no_context",
+      has_gakuwari: false,
+      confidence: "low",
+    });
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("/search?"))
+    ).toHaveLength(0);
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("/chat/completions"))
+    ).toHaveLength(0);
+    expect(
+      warnSpy.mock.calls
+        .flat()
+        .map((value) => String(value))
+        .some(
+          (line) =>
+            line.includes('"event":"candidate_halt"') &&
+            line.includes('"haltReason":"details_unusable_context"')
+        )
+    ).toBe(true);
+  });
+
   it("runs wave 2 when wave 1 has no hits and keeps the configured radius", async () => {
     const broadResults = createOrderedCafes(16, "Wave Cafe");
     const detailsById = createDetailsByPlaceId(broadResults);
@@ -330,7 +610,7 @@ describe("searchGakuwariSpots", () => {
 
     const results = await searchGakuwariSpots(35.6595, 139.7005, 500, "cafe");
 
-    expect(results).toHaveLength(16);
+    expect(results).toHaveLength(12);
     expect(
       results.some((result) => result.name === "Wave Cafe 09" && result.has_gakuwari)
     ).toBe(true);
@@ -424,7 +704,8 @@ describe("searchGakuwariSpots", () => {
       has_gakuwari: true,
       confidence: "medium",
     });
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(mockedMakeRequest).toHaveBeenCalledTimes(4);
   });
 
   it("lets the reviewer recover a high-priority low-confidence negative", async () => {

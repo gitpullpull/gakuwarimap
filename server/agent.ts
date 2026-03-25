@@ -3,6 +3,15 @@ import {
   type PlaceDetailsResult,
   type PlacesSearchResult,
 } from "./_core/map";
+import {
+  categorizeShop,
+  getDefaultSpecialtyProfiles,
+  selectCategorySearchProfiles,
+  type CategoryBudgetPolicy,
+  type PreparedSearchProfile,
+  type ShopCategoryMatch,
+  type StudentDiscountCategoryId,
+} from "./_core/studentDiscountCategoryCatalog";
 import { resolveMapsMode } from "./_core/platform";
 import { createLLMProvider } from "./_core/providers";
 
@@ -110,6 +119,11 @@ type GeminiChatCompletionResponse = {
       tool_calls?: AgentToolCall[];
     };
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
 };
 
 type ParsedAgentResult = Omit<AgentResultItem, "place_id" | "name">;
@@ -149,6 +163,11 @@ interface SearchContext {
   keyword?: string;
   normalizedKeyword: string;
   preferredProfileIds: Set<string>;
+  matchedCategoryIds: StudentDiscountCategoryId[];
+  matchedAliases: string[];
+  apiBoostEnabled: boolean;
+  budgetPolicy: Record<string, CategoryBudgetPolicy>;
+  broadOnlyReason?: string;
 }
 
 interface CandidateAccumulator {
@@ -184,13 +203,77 @@ interface EvidenceBundle {
   summary: string;
 }
 
+type StepProvider = "nearby" | "details" | "brave" | "gemini";
+
+type StepStage =
+  | "candidate_search"
+  | "pagination"
+  | "details"
+  | "retriever"
+  | "verifier"
+  | "reviewer";
+
+type CandidateHaltStage = "details" | "retriever" | "verifier";
+
+type CandidateHaltReason =
+  | "details_unusable_context"
+  | "brave_request_failed"
+  | "brave_no_evidence"
+  | "gemini_failed";
+
+interface ProviderFailure {
+  provider: StepProvider;
+  stage: StepStage;
+  reason: string;
+  message: string;
+  httpStatus?: number;
+  providerStatus?: string;
+  query?: string;
+  retryable: boolean;
+  attempt?: number;
+  bodyPreview?: string;
+}
+
+interface StepDiagnostics {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+}
+
+interface SearchRunDiagnostics {
+  profiles: string[];
+  matchedCategoryIds: StudentDiscountCategoryId[];
+  matchedAliases: string[];
+  apiBoostEnabled: boolean;
+  budgetPolicy: Record<string, CategoryBudgetPolicy>;
+  broadOnlyReason?: string;
+  candidatesPrepared: number;
+  candidatesInvestigated: number;
+  candidatesHalted: number;
+  nearby: StepDiagnostics;
+  details: StepDiagnostics;
+  brave: StepDiagnostics;
+  gemini: StepDiagnostics;
+}
+
+interface InvestigationCandidate extends RankedCandidate {
+  providerFailures: ProviderFailure[];
+  haltedAt?: CandidateHaltStage;
+  haltReason?: CandidateHaltReason;
+}
+
 interface InvestigationOutcome {
-  shop: RankedCandidate;
+  shop: InvestigationCandidate;
   evidence: EvidenceBundle;
   result: AgentResultItem;
   rank: number;
   reviewed: boolean;
   reviewerTriggered: boolean;
+  verifierCompleted: boolean;
+  haltedAt?: CandidateHaltStage;
+  haltReason?: CandidateHaltReason;
+  providerFailures: ProviderFailure[];
   verifier: "Verifier";
   reviewer?: "Reviewer";
 }
@@ -199,19 +282,28 @@ const DEFAULT_BRAVE_SEARCH_API_URL = "https://api.search.brave.com/res/v1/web/se
 const DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview";
 const DEFAULT_GEMINI_OPENAI_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai";
-const SEARCH_STRATEGY_VERSION = "agent-team-v1";
+const SEARCH_STRATEGY_VERSION = "agent-team-v2";
 const MAX_SHOPS = 20;
 const BATCH_SIZE = 6;
 const MAX_CANDIDATES = 60;
-const MAX_DETAILS_SHOPS = 24;
-const MAX_PROFILE_NEXT_PAGES = 2;
+const MAX_DETAILS_SHOPS = 12;
+const MAX_SPECIALTY_PROFILES_WITHOUT_KEYWORD = 2;
+const MAX_PREFERRED_SPECIALTY_PROFILES = 2;
+const MAX_BROAD_NEXT_PAGES = 1;
 const MAX_SEARCH_RESULTS_PER_QUERY = 4;
 const MAX_EVIDENCE_SNIPPETS = 6;
+const MAX_EVIDENCE_QUERIES = 2;
 const WAVE_ONE_SIZE = 8;
 const WAVE_TWO_SIZE = 8;
 const MAX_INVESTIGATED_AFTER_HIT = 12;
 const INVESTIGATION_BATCH_SIZE = 4;
+const MAX_REVIEW_TARGETS = 2;
 const AGENT_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
+const CANDIDATE_CACHE_TTL_MS = 1000 * 60 * 10;
+const PLACE_DETAILS_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
+const BRAVE_MAX_ATTEMPTS = 2;
+const BRAVE_MAX_FAILURE_BODY_CHARS = 300;
+const PAGINATION_RETRY_DELAYS_MS = [2_000, 3_000, 4_000] as const;
 const GENERIC_STUDENT_EVIDENCE_KEYWORDS = [
   "学割",
   "学生割引",
@@ -326,6 +418,21 @@ const agentResultCache = new Map<
     result: ParsedAgentResult;
   }
 >();
+const candidateSearchCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    candidates: RankedCandidate[];
+  }
+>();
+const placeDetailsCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    address: string;
+    website?: string;
+  }
+>();
 
 const createDefaultResult = (shop: AgentShop): AgentResultItem => ({
   place_id: shop.place_id,
@@ -370,6 +477,173 @@ function getGeminiConfig() {
       DEFAULT_GEMINI_OPENAI_BASE_URL
     ).replace(/\/+$/, ""),
   };
+}
+
+function createStepDiagnostics(): StepDiagnostics {
+  return {
+    attempted: 0,
+    succeeded: 0,
+    failed: 0,
+    skipped: 0,
+  };
+}
+
+function createSearchRunDiagnostics(): SearchRunDiagnostics {
+  return {
+    profiles: [],
+    matchedCategoryIds: [],
+    matchedAliases: [],
+    apiBoostEnabled: false,
+    budgetPolicy: {},
+    candidatesPrepared: 0,
+    candidatesInvestigated: 0,
+    candidatesHalted: 0,
+    nearby: createStepDiagnostics(),
+    details: createStepDiagnostics(),
+    brave: createStepDiagnostics(),
+    gemini: createStepDiagnostics(),
+  };
+}
+
+function getStepDiagnostics(
+  diagnostics: SearchRunDiagnostics,
+  provider: StepProvider
+): StepDiagnostics {
+  return diagnostics[provider];
+}
+
+function logAgentEvent(
+  level: "log" | "warn" | "error",
+  event: Record<string, unknown>
+): void {
+  const line = `[Agent][Diag] ${JSON.stringify({
+    ts: new Date().toISOString(),
+    ...event,
+  })}`;
+  if (level === "warn") {
+    console.warn(line);
+    return;
+  }
+  if (level === "error") {
+    console.error(line);
+    return;
+  }
+  console.log(line);
+}
+
+function logApiEvent(
+  level: "log" | "warn" | "error",
+  event: {
+    stage: StepStage;
+    provider: StepProvider;
+    action: "abort_candidate" | "abort_profile" | "retry" | "continue";
+    shop?: string;
+    placeId?: string;
+    profileId?: string;
+    query?: string;
+    httpStatus?: number;
+    providerStatus?: string;
+    attempt?: number;
+    durationMs?: number;
+    retryable?: boolean;
+    bodyPreview?: string;
+    message?: string;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  }
+): void {
+  logAgentEvent(level, {
+    event: "api_call",
+    ...event,
+  });
+}
+
+function logCandidateHalt(
+  shop: Pick<AgentShop, "name" | "place_id">,
+  haltedAt: CandidateHaltStage,
+  haltReason: CandidateHaltReason,
+  skipped: string[],
+  providerFailures: ProviderFailure[]
+): void {
+  logAgentEvent("warn", {
+    event: "candidate_halt",
+    shop: shop.name,
+    placeId: shop.place_id,
+    haltedAt,
+    haltReason,
+    skipped,
+    providerFailures,
+  });
+}
+
+function isUsableAddress(address?: string): boolean {
+  return typeof address === "string" && address.trim().length > 0;
+}
+
+function shouldLookupPlaceDetails(shop: AgentShop): boolean {
+  return !shop.website || !isUsableAddress(shop.address);
+}
+
+function hasUsableInvestigationContext(shop: AgentShop): boolean {
+  return isUsableAddress(shop.address) || Boolean(shop.website?.trim());
+}
+
+function createEmptyEvidenceBundle(
+  shop: AgentShop,
+  queries: string[],
+  summary: string
+): EvidenceBundle {
+  return {
+    shop,
+    retriever: "Retriever",
+    queries,
+    snippets: [],
+    sourceUrls: [],
+    summary,
+  };
+}
+
+function createInvestigationCandidate(candidate: RankedCandidate): InvestigationCandidate {
+  return {
+    ...candidate,
+    matchedProfileIds: [...candidate.matchedProfileIds],
+    types: candidate.types ? [...candidate.types] : undefined,
+    providerFailures: [],
+  };
+}
+
+function appendProviderFailure<T extends AgentShop>(
+  shop: T,
+  failure: ProviderFailure
+): T {
+  if (!("providerFailures" in shop)) {
+    return shop;
+  }
+
+  const candidate = shop as T & InvestigationCandidate;
+  return {
+    ...candidate,
+    providerFailures: [...candidate.providerFailures, failure],
+  } as T;
+}
+
+function haltPreparedCandidate<T extends AgentShop>(
+  shop: T,
+  haltReason: CandidateHaltReason,
+  failure: ProviderFailure
+): T {
+  if (!("providerFailures" in shop)) {
+    return shop;
+  }
+
+  const candidate = shop as T & InvestigationCandidate;
+  return {
+    ...candidate,
+    providerFailures: [...candidate.providerFailures, failure],
+    haltedAt: "details",
+    haltReason,
+  } as T;
 }
 
 function normalizeConfidence(value: unknown): AgentConfidence {
@@ -551,10 +825,15 @@ export function parseAgentResult(
 
 export type LLMProviderMode = "gemini" | "ollama";
 
-async function callLLMForAgent(
+type AgentLLMInvocation = {
+  content: string;
+  usage?: GeminiChatCompletionResponse["usage"];
+};
+
+async function callLLMForAgentDetailed(
   messages: AgentMessage[],
   provider: LLMProviderMode = "gemini"
-): Promise<string> {
+): Promise<AgentLLMInvocation> {
   if (provider === "ollama") {
     const llm = createLLMProvider({
       ...process.env,
@@ -574,9 +853,12 @@ async function callLLMForAgent(
       throw new Error("Ollama returned no message");
     }
 
-    return typeof raw === "string"
-      ? raw
-      : raw.map((chunk) => (chunk.type === "text" ? chunk.text : "")).join("");
+    return {
+      content:
+        typeof raw === "string"
+          ? raw
+          : raw.map((chunk) => (chunk.type === "text" ? chunk.text : "")).join(""),
+    };
   }
 
   const result = await callGeminiChatCompletion(messages);
@@ -586,7 +868,17 @@ async function callLLMForAgent(
     throw new Error("Gemini returned no message");
   }
 
-  return content;
+  return {
+    content,
+    usage: result.usage,
+  };
+}
+
+async function callLLMForAgent(
+  messages: AgentMessage[],
+  provider: LLMProviderMode = "gemini"
+): Promise<string> {
+  return (await callLLMForAgentDetailed(messages, provider)).content;
 }
 
 async function callGeminiChatCompletion(
@@ -660,22 +952,65 @@ function normalizeBraveSearchResults(
     .filter((result) => Boolean(result.title || result.url || result.content));
 }
 
-async function braveSearch(query: string): Promise<string> {
-  try {
-    const apiKey = getBraveSearchApiKey();
-    if (!apiKey) {
-      return "Search error: BRAVE_SEARCH_API_KEY or BRAVE_API_KEY is not configured";
-    }
+type BraveRequestSuccess = {
+  ok: true;
+  status: number;
+  durationMs: number;
+  results: BraveSearchResult[];
+};
 
-    const params = new URLSearchParams({
-      q: query,
-      count: "5",
-      country: "JP",
-      search_lang: "ja",
-      extra_snippets: "true",
-    });
+type BraveRequestFailure = {
+  ok: false;
+  status?: number;
+  durationMs: number;
+  retryable: boolean;
+  message: string;
+  bodyPreview?: string;
+};
+
+type BraveRequestResult = BraveRequestSuccess | BraveRequestFailure;
+
+function buildBraveSearchParams(query: string, count: number): URLSearchParams {
+  return new URLSearchParams({
+    q: query,
+    count: String(count),
+    country: "JP",
+    extra_snippets: "true",
+  });
+}
+
+function isRetryableBraveStatus(status?: number): boolean {
+  return status === 429 || Boolean(status && status >= 500 && status < 600);
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "TimeoutError" ||
+      error.name === "AbortError" ||
+      /timed? out/i.test(error.message))
+  );
+}
+
+async function executeBraveSearchRequest(
+  query: string,
+  count: number
+): Promise<BraveRequestResult> {
+  const apiKey = getBraveSearchApiKey();
+  if (!apiKey) {
+    return {
+      ok: false,
+      durationMs: 0,
+      retryable: false,
+      message: "BRAVE_SEARCH_API_KEY or BRAVE_API_KEY is not configured",
+    };
+  }
+
+  const startedAt = performance.now();
+
+  try {
     const response = await fetch(
-      `${getBraveSearchApiUrl()}?${params.toString()}`,
+      `${getBraveSearchApiUrl()}?${buildBraveSearchParams(query, count).toString()}`,
       {
         method: "GET",
         headers: {
@@ -687,35 +1022,70 @@ async function braveSearch(query: string): Promise<string> {
       }
     );
 
+    const rawBody = await response.text();
+    const durationMs = Math.round(performance.now() - startedAt);
     if (!response.ok) {
-      console.warn(
-        `[Agent][Tool] web_search failed (${response.status}): query="${query}"`
-      );
-        return `Search error: status ${response.status}`;
-      }
-
-    const data = (await response.json()) as BraveSearchResponse;
-    const results = normalizeBraveSearchResults(data);
-
-    if (results.length === 0) {
-      return "No search results found.";
+      return {
+        ok: false,
+        status: response.status,
+        durationMs,
+        retryable: isRetryableBraveStatus(response.status),
+        message: `Brave Search request failed (${response.status})`,
+        bodyPreview: rawBody.slice(0, BRAVE_MAX_FAILURE_BODY_CHARS),
+      };
     }
 
-    return results
-      .slice(0, 5)
-      .map(
-        (result, index) =>
-          `[${index + 1}] ${result.title}\nURL: ${result.url}\n${
-            result.content || "(no summary)"
-          }`
-      )
-      .join("\n\n");
+    try {
+      const data = JSON.parse(rawBody) as BraveSearchResponse;
+      return {
+        ok: true,
+        status: response.status,
+        durationMs,
+        results: normalizeBraveSearchResults(data).slice(0, count),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        status: response.status,
+        durationMs,
+        retryable: false,
+        message:
+          error instanceof Error ? error.message : "Failed to parse Brave response",
+        bodyPreview: rawBody.slice(0, BRAVE_MAX_FAILURE_BODY_CHARS),
+      };
+    }
   } catch (error) {
-    console.error("[Agent][Tool] web_search error:", error);
-    return `Search error: ${
-      error instanceof Error ? error.message : "unknown error"
-    }`;
+    return {
+      ok: false,
+      durationMs: Math.round(performance.now() - startedAt),
+      retryable: isTimeoutError(error),
+      message: error instanceof Error ? error.message : "unknown error",
+    };
   }
+}
+
+async function braveSearch(query: string): Promise<string> {
+  const response = await executeBraveSearchRequest(query, 5);
+  if (!response.ok) {
+    console.warn(
+      `[Agent][Tool] web_search failed (${response.status ?? "no-status"}): query="${query}"`
+    );
+    return `Search error: ${response.message}`;
+  }
+
+  if (response.results.length === 0) {
+    return "No search results found.";
+  }
+
+  return response.results
+    .slice(0, 5)
+    .map(
+      (result, index) =>
+        `[${index + 1}] ${result.title}\nURL: ${result.url}\n${
+          result.content || "(no summary)"
+        }`
+    )
+    .join("\n\n");
 }
 
 function getAgentCacheKey(shop: AgentShop, searchQuery: string): string {
@@ -760,6 +1130,85 @@ function cacheAgentResult(cacheKey: string, result: AgentResultItem): void {
       confidence: result.confidence,
     },
   });
+}
+
+function cloneRankedCandidate(candidate: RankedCandidate): RankedCandidate {
+  return {
+    ...candidate,
+    matchedProfileIds: [...candidate.matchedProfileIds],
+    types: candidate.types ? [...candidate.types] : undefined,
+  };
+}
+
+function getCandidateSearchCacheKey(context: SearchContext): string {
+  return [
+    context.lat.toFixed(5),
+    context.lng.toFixed(5),
+    String(context.radius),
+    context.normalizedKeyword,
+  ].join("::");
+}
+
+function getCachedCandidateSearch(cacheKey: string): RankedCandidate[] | null {
+  const cached = candidateSearchCache.get(cacheKey);
+
+  if (!cached) {
+    return null;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    candidateSearchCache.delete(cacheKey);
+    return null;
+  }
+
+  return cached.candidates.map(cloneRankedCandidate);
+}
+
+function cacheCandidateSearch(
+  cacheKey: string,
+  candidates: RankedCandidate[]
+): void {
+  candidateSearchCache.set(cacheKey, {
+    expiresAt: Date.now() + CANDIDATE_CACHE_TTL_MS,
+    candidates: candidates.map(cloneRankedCandidate),
+  });
+}
+
+function getCachedPlaceDetails(
+  placeId: string
+): { address: string; website?: string } | null {
+  const cached = placeDetailsCache.get(placeId);
+
+  if (!cached) {
+    return null;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    placeDetailsCache.delete(placeId);
+    return null;
+  }
+
+  return {
+    address: cached.address,
+    website: cached.website,
+  };
+}
+
+function cachePlaceDetails(
+  placeId: string,
+  details: { address: string; website?: string }
+): void {
+  placeDetailsCache.set(placeId, {
+    expiresAt: Date.now() + PLACE_DETAILS_CACHE_TTL_MS,
+    address: details.address,
+    website: details.website,
+  });
+}
+
+export function resetAgentCaches(): void {
+  agentResultCache.clear();
+  candidateSearchCache.clear();
+  placeDetailsCache.clear();
 }
 
 function getWebsiteHost(website?: string): string | null {
@@ -861,75 +1310,54 @@ function getShopSearchText(shop: AgentShop): string {
   return `${shop.name} ${shop.address} ${(shop.types ?? []).join(" ")}`;
 }
 
-function isBeautySalonLike(shop: AgentShop): boolean {
-  if (hasAnyPlaceType(shop, "hair_care", "beauty_salon")) {
-    return true;
-  }
+function getShopCategoryMatches(shop: AgentShop): ShopCategoryMatch[] {
+  return categorizeShop({
+    name: shop.name,
+    address: shop.address,
+    types: shop.types,
+  });
+}
 
-  return /ヘア|美容|理容|サロン|barber|beauty|hair|カット|カラー|パーマ/i.test(
-    getShopSearchText(shop)
+function hasCategoryMatch(
+  shop: AgentShop,
+  ...categoryIds: StudentDiscountCategoryId[]
+): boolean {
+  const matches = getShopCategoryMatches(shop);
+  return categoryIds.some((categoryId) =>
+    matches.some((match) => match.category.id === categoryId)
   );
+}
+
+function getPrimaryCategoryMatch(shop: AgentShop): ShopCategoryMatch | undefined {
+  return getShopCategoryMatches(shop)[0];
+}
+
+function getCategoryPromptExamples(shop: AgentShop): string[] {
+  return getPrimaryCategoryMatch(shop)?.category.promptExamples ?? [];
+}
+
+function isBeautySalonLike(shop: AgentShop): boolean {
+  return hasCategoryMatch(shop, "hair_care", "beauty_services");
 }
 
 function isKaraokeOrAmusementShop(shop: AgentShop): boolean {
-  if (hasAnyPlaceType(shop, "karaoke", "bowling_alley", "amusement_center")) {
-    return true;
-  }
-
-  return /カラオケ|まねきねこ|ビッグエコー|ジャンカラ|コート・ダジュール|ラウンドワン|round1/i.test(
-    getShopSearchText(shop)
-  );
+  return hasCategoryMatch(shop, "karaoke_amusement");
 }
 
 function isCinemaOrTicketedVenue(shop: AgentShop): boolean {
-  if (
-    hasAnyPlaceType(
-      shop,
-      "movie_theater",
-      "museum",
-      "art_gallery",
-      "tourist_attraction",
-      "amusement_park",
-      "aquarium",
-      "zoo"
-    )
-  ) {
-    return true;
-  }
-
-  return /映画|シネマ|劇場|博物館|美術館|水族館|動物園|テーマパーク|展望台/i.test(
-    getShopSearchText(shop)
-  );
+  return hasCategoryMatch(shop, "movie_theater", "ticketed_venue");
 }
 
 function isFitnessOrActivityShop(shop: AgentShop): boolean {
-  if (hasAnyPlaceType(shop, "gym", "spa", "stadium")) {
-    return true;
-  }
-
-  return /ジム|フィットネス|ヨガ|ピラティス|ボルダリング|スイミング|テニス/i.test(
-    getShopSearchText(shop)
-  );
+  return hasCategoryMatch(shop, "fitness");
 }
 
 function isFoodOrCafeShop(shop: AgentShop): boolean {
-  if (hasAnyPlaceType(shop, "restaurant", "cafe", "bakery", "meal_takeaway")) {
-    return true;
-  }
-
-  return /カフェ|喫茶|レストラン|食堂|ランチ|定食|ラーメン|居酒屋|バーガー/i.test(
-    getShopSearchText(shop)
-  );
+  return hasCategoryMatch(shop, "food_drink");
 }
 
 function isRetailOrStudyShop(shop: AgentShop): boolean {
-  if (hasAnyPlaceType(shop, "book_store", "clothing_store", "store", "library")) {
-    return true;
-  }
-
-  return /書店|本屋|古本|アパレル|服|メガネ|携帯|スマホ|塾|予備校|自習室|コワーキング|ネットカフェ|漫画喫茶/i.test(
-    getShopSearchText(shop)
-  );
+  return hasCategoryMatch(shop, "study_retail", "study_space", "fashion");
 }
 
 function getAdaptiveStudentEvidenceKeywords(
@@ -1109,6 +1537,20 @@ function normalizeSearchKeyword(keyword?: string): string {
   return keyword?.trim().toLowerCase() ?? "";
 }
 
+function toSearchProfile(
+  profile: PreparedSearchProfile,
+  keyword?: string
+): SearchProfile {
+  return {
+    id: profile.id,
+    label: profile.label,
+    priority: 220 + profile.bias,
+    scout: "Scout/Ranker",
+    type: profile.type,
+    keyword: keyword?.trim() || profile.defaultKeyword,
+  };
+}
+
 function createSearchContext(
   lat: number,
   lng: number,
@@ -1116,27 +1558,26 @@ function createSearchContext(
   keyword?: string
 ): SearchContext {
   const normalizedKeyword = normalizeSearchKeyword(keyword);
+  const selection = selectCategorySearchProfiles(keyword);
   return {
     lat,
     lng,
     radius,
     keyword: keyword?.trim() || undefined,
     normalizedKeyword,
-    preferredProfileIds: new Set(
-      SEARCH_PROFILE_DEFINITIONS.filter(
-        (definition) => normalizedKeyword && definition.matcher.test(normalizedKeyword)
-      ).map((definition) => definition.id)
-    ),
+    preferredProfileIds: new Set(selection.preferredProfileIds),
+    matchedCategoryIds: selection.matchedCategoryIds,
+    matchedAliases: selection.matchedAliases,
+    apiBoostEnabled: selection.apiBoostEnabled,
+    budgetPolicy: selection.budgetPolicy,
+    broadOnlyReason: selection.broadOnlyReason,
   };
 }
 
-function buildAgentTeamProfiles(keyword?: string): SearchProfile[] {
+export function buildAgentTeamProfiles(keyword?: string): SearchProfile[] {
   const normalizedKeyword = normalizeSearchKeyword(keyword);
-  const preferredProfileIds = new Set(
-    SEARCH_PROFILE_DEFINITIONS.filter(
-      (definition) => normalizedKeyword && definition.matcher.test(normalizedKeyword)
-    ).map((definition) => definition.id)
-  );
+  const selection = selectCategorySearchProfiles(keyword);
+  const preferredProfileIds = new Set(selection.preferredProfileIds);
 
   const profiles: SearchProfile[] = [
     {
@@ -1146,22 +1587,36 @@ function buildAgentTeamProfiles(keyword?: string): SearchProfile[] {
       scout: "Scout/Ranker",
       keyword: keyword?.trim() || undefined,
     },
-    ...SEARCH_PROFILE_DEFINITIONS.map((definition) => {
-      const preferred = preferredProfileIds.has(definition.id);
-      return {
-        id: definition.id,
-        label: definition.label,
-        scout: "Scout/Ranker" as const,
-        type: definition.type,
-        keyword: preferred
-          ? keyword?.trim() || undefined
-          : definition.defaultKeyword,
-        priority: (preferred ? 380 : 220) + definition.bias,
-      };
-    }),
   ];
 
-  return profiles.sort((left, right) => right.priority - left.priority);
+  const [broadProfile] = profiles;
+
+  if (!broadProfile) {
+    return [];
+  }
+
+  if (preferredProfileIds.size > 0) {
+    return [
+      broadProfile,
+      ...selection.matchedProfiles
+        .map((profile) => ({
+          ...toSearchProfile(profile, keyword),
+          priority: 380 + profile.bias,
+        }))
+        .slice(0, MAX_PREFERRED_SPECIALTY_PROFILES),
+    ];
+  }
+
+  if (normalizedKeyword) {
+    return [broadProfile];
+  }
+
+  return [
+    broadProfile,
+    ...getDefaultSpecialtyProfiles()
+      .map((profile) => toSearchProfile(profile, keyword))
+      .slice(0, MAX_SPECIALTY_PROFILES_WITHOUT_KEYWORD),
+  ];
 }
 
 function delay(ms: number): Promise<void> {
@@ -1170,8 +1625,15 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-function getNextPageDelayMs(): number {
-  return 1_500;
+function getNextPageDelayMs(attempt: number): number {
+  if (process.env.NODE_ENV === "test") {
+    return 0;
+  }
+  return PAGINATION_RETRY_DELAYS_MS[Math.max(0, attempt - 1)] ?? 4_000;
+}
+
+function getMaxNextPagesForProfile(profile: SearchProfile): number {
+  return profile.id === "broad" ? MAX_BROAD_NEXT_PAGES : 0;
 }
 
 function toRadians(value: number): number {
@@ -1226,12 +1688,7 @@ function mergeShop(existing: AgentShop, incoming: AgentShop): AgentShop {
 }
 
 function getCandidateCategoryBias(shop: AgentShop): number {
-  if (isBeautySalonLike(shop)) return 26;
-  if (isCinemaOrTicketedVenue(shop) || isKaraokeOrAmusementShop(shop)) return 22;
-  if (isFoodOrCafeShop(shop)) return 16;
-  if (isRetailOrStudyShop(shop)) return 14;
-  if (isFitnessOrActivityShop(shop)) return 12;
-  return 0;
+  return getPrimaryCategoryMatch(shop)?.category.candidateBias ?? 0;
 }
 
 function getStudentSignalScore(shop: AgentShop): number {
@@ -1239,17 +1696,7 @@ function getStudentSignalScore(shop: AgentShop): number {
     return 12;
   }
 
-  if (isBeautySalonLike(shop)) return 10;
-  if (isCinemaOrTicketedVenue(shop) || isKaraokeOrAmusementShop(shop)) return 8;
-  if (
-    isFoodOrCafeShop(shop) ||
-    isRetailOrStudyShop(shop) ||
-    isFitnessOrActivityShop(shop)
-  ) {
-    return 4;
-  }
-
-  return 0;
+  return getPrimaryCategoryMatch(shop)?.category.studentSignalScore ?? 0;
 }
 
 function computeCandidateScore(
@@ -1344,7 +1791,8 @@ function upsertCandidate(
 async function searchNearbyPlacesProfilePage(
   context: SearchContext,
   profile: SearchProfile,
-  nextPageToken?: string
+  nextPageToken?: string,
+  paginationAttempt: number = 1
 ): Promise<PlacesSearchResult> {
   const params: Record<string, unknown> = nextPageToken
     ? {
@@ -1361,24 +1809,87 @@ async function searchNearbyPlacesProfilePage(
     if (profile.type) params.type = profile.type;
     if (profile.keyword) params.keyword = profile.keyword;
   } else {
-    await delay(getNextPageDelayMs());
+    await delay(getNextPageDelayMs(paginationAttempt));
   }
 
-  const result = await makeRequest<PlacesSearchResult>(
-    "/maps/api/place/nearbysearch/json",
-    params
-  );
+  return makeRequest<PlacesSearchResult>("/maps/api/place/nearbysearch/json", params);
+}
 
-  if (result.status !== "OK" && result.status !== "ZERO_RESULTS") {
-    throw new Error(`Places API error: ${result.status}`);
+async function searchNearbyPlacesPaginationWithRetry(
+  context: SearchContext,
+  profile: SearchProfile,
+  nextPageToken: string,
+  diagnostics?: SearchRunDiagnostics
+): Promise<PlacesSearchResult> {
+  for (let attempt = 1; attempt <= PAGINATION_RETRY_DELAYS_MS.length; attempt += 1) {
+    const nearbyDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "nearby") : null;
+    nearbyDiagnostics && (nearbyDiagnostics.attempted += 1);
+    const startedAt = performance.now();
+
+    try {
+      const result = await searchNearbyPlacesProfilePage(
+        context,
+        profile,
+        nextPageToken,
+        attempt
+      );
+
+      if (result.status === "OK" || result.status === "ZERO_RESULTS") {
+        nearbyDiagnostics && (nearbyDiagnostics.succeeded += 1);
+        logApiEvent("log", {
+          stage: "pagination",
+          provider: "nearby",
+          action: "continue",
+          profileId: profile.id,
+          providerStatus: result.status,
+          attempt,
+          durationMs: Math.round(performance.now() - startedAt),
+          retryable: false,
+        });
+        return result;
+      }
+
+      nearbyDiagnostics && (nearbyDiagnostics.failed += 1);
+      const retryable =
+        result.status === "INVALID_REQUEST" && attempt < PAGINATION_RETRY_DELAYS_MS.length;
+      logApiEvent(retryable ? "warn" : "error", {
+        stage: "pagination",
+        provider: "nearby",
+        action: retryable ? "retry" : "abort_profile",
+        profileId: profile.id,
+        providerStatus: result.status,
+        attempt,
+        durationMs: Math.round(performance.now() - startedAt),
+        retryable,
+        message: `Places API error: ${result.status}`,
+      });
+      if (retryable) {
+        continue;
+      }
+      return { status: "ZERO_RESULTS", results: [] } as PlacesSearchResult;
+    } catch (error) {
+      nearbyDiagnostics && (nearbyDiagnostics.failed += 1);
+      logApiEvent("error", {
+        stage: "pagination",
+        provider: "nearby",
+        action: "abort_profile",
+        profileId: profile.id,
+        attempt,
+        durationMs: Math.round(performance.now() - startedAt),
+        retryable: false,
+        message: error instanceof Error ? error.message : "Unknown nearby pagination error",
+      });
+      return { status: "ZERO_RESULTS", results: [] } as PlacesSearchResult;
+    }
   }
 
-  return result;
+  return { status: "ZERO_RESULTS", results: [] } as PlacesSearchResult;
 }
 
 async function collectCandidateSeeds(
   context: SearchContext,
-  profiles: SearchProfile[]
+  profiles: SearchProfile[],
+  diagnostics?: SearchRunDiagnostics
 ): Promise<CandidateSeed[]> {
   const candidates = new Map<string, CandidateAccumulator>();
   const pagingState = new Map<
@@ -1388,10 +1899,50 @@ async function collectCandidateSeeds(
 
   const firstPages = await Promise.all(
     profiles.map(async (profile) => {
+      const nearbyDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "nearby") : null;
+      nearbyDiagnostics && (nearbyDiagnostics.attempted += 1);
+      const startedAt = performance.now();
       try {
         const result = await searchNearbyPlacesProfilePage(context, profile);
+        if (result.status !== "OK" && result.status !== "ZERO_RESULTS") {
+          nearbyDiagnostics && (nearbyDiagnostics.failed += 1);
+          logApiEvent("error", {
+            stage: "candidate_search",
+            provider: "nearby",
+            action: "abort_profile",
+            profileId: profile.id,
+            providerStatus: result.status,
+            durationMs: Math.round(performance.now() - startedAt),
+            retryable: false,
+            message: `Places API error: ${result.status}`,
+          });
+          return {
+            profile,
+            result: { status: "ZERO_RESULTS", results: [] } as PlacesSearchResult,
+          };
+        }
+        nearbyDiagnostics && (nearbyDiagnostics.succeeded += 1);
+        logApiEvent("log", {
+          stage: "candidate_search",
+          provider: "nearby",
+          action: "continue",
+          profileId: profile.id,
+          providerStatus: result.status,
+          durationMs: Math.round(performance.now() - startedAt),
+          retryable: false,
+        });
         return { profile, result };
       } catch (error) {
+        nearbyDiagnostics && (nearbyDiagnostics.failed += 1);
+        logApiEvent("error", {
+          stage: "candidate_search",
+          provider: "nearby",
+          action: "abort_profile",
+          profileId: profile.id,
+          durationMs: Math.round(performance.now() - startedAt),
+          retryable: false,
+          message: error instanceof Error ? error.message : "Unknown nearby search error",
+        });
         console.warn(
           `[Agent][Scout] profile=${profile.id} failed during first page`,
           error
@@ -1409,7 +1960,7 @@ async function collectCandidateSeeds(
       upsertCandidate(candidates, toAgentShop(place), profile, context);
     }
 
-    if (result.next_page_token) {
+    if (result.next_page_token && getMaxNextPagesForProfile(profile) > 0) {
       pagingState.set(profile.id, {
         profile,
         nextPageToken: result.next_page_token,
@@ -1427,16 +1978,17 @@ async function collectCandidateSeeds(
         continue;
       }
 
-      if (state.fetchedNextPages >= MAX_PROFILE_NEXT_PAGES) {
+      if (state.fetchedNextPages >= getMaxNextPagesForProfile(profile)) {
         pagingState.delete(profile.id);
         continue;
       }
 
       try {
-        const result = await searchNearbyPlacesProfilePage(
+        const result = await searchNearbyPlacesPaginationWithRetry(
           context,
           profile,
-          state.nextPageToken
+          state.nextPageToken,
+          diagnostics
         );
 
         for (const place of result.results || []) {
@@ -1447,7 +1999,10 @@ async function collectCandidateSeeds(
         state.nextPageToken = result.next_page_token;
         progressed = true;
 
-        if (!state.nextPageToken || state.fetchedNextPages >= MAX_PROFILE_NEXT_PAGES) {
+        if (
+          !state.nextPageToken ||
+          state.fetchedNextPages >= getMaxNextPagesForProfile(profile)
+        ) {
           pagingState.delete(profile.id);
         }
 
@@ -1455,10 +2010,6 @@ async function collectCandidateSeeds(
           break;
         }
       } catch (error) {
-        console.warn(
-          `[Agent][Scout] profile=${profile.id} failed during pagination`,
-          error
-        );
         pagingState.delete(profile.id);
       }
     }
@@ -1480,7 +2031,8 @@ export async function collectCandidateShops(
   lat: number,
   lng: number,
   radius: number = 500,
-  keyword?: string
+  keyword?: string,
+  diagnostics?: SearchRunDiagnostics
 ): Promise<RankedCandidate[]> {
   try {
     resolveMapsMode();
@@ -1489,78 +2041,95 @@ export async function collectCandidateShops(
   }
 
   const context = createSearchContext(lat, lng, radius, keyword);
+  const cacheKey = getCandidateSearchCacheKey(context);
   const profiles = buildAgentTeamProfiles(keyword);
-  const seeds = await collectCandidateSeeds(context, profiles);
+  if (diagnostics) {
+    diagnostics.profiles = profiles.map((profile) => profile.id);
+    diagnostics.matchedCategoryIds = [...context.matchedCategoryIds];
+    diagnostics.matchedAliases = [...context.matchedAliases];
+    diagnostics.apiBoostEnabled = context.apiBoostEnabled;
+    diagnostics.budgetPolicy = { ...context.budgetPolicy };
+    diagnostics.broadOnlyReason = context.broadOnlyReason;
+  }
+  const cached = getCachedCandidateSearch(cacheKey);
+  if (cached) {
+    return cached;
+  }
 
-  return rankCandidateSeeds(seeds, context, false).slice(0, MAX_CANDIDATES);
+  const seeds = await collectCandidateSeeds(context, profiles, diagnostics);
+  const rankedCandidates = rankCandidateSeeds(seeds, context, false).slice(
+    0,
+    MAX_CANDIDATES
+  );
+  cacheCandidateSearch(cacheKey, rankedCandidates);
+  return rankedCandidates;
 }
 
 async function prepareCandidatesForInvestigation(
   lat: number,
   lng: number,
   radius: number,
-  keyword?: string
-): Promise<RankedCandidate[]> {
+  keyword?: string,
+  diagnostics?: SearchRunDiagnostics
+): Promise<InvestigationCandidate[]> {
   const context = createSearchContext(lat, lng, radius, keyword);
-  const rankedCandidates = await collectCandidateShops(lat, lng, radius, keyword);
+  const rankedCandidates = await collectCandidateShops(
+    lat,
+    lng,
+    radius,
+    keyword,
+    diagnostics
+  );
   const topCandidates = rankedCandidates.slice(0, MAX_DETAILS_SHOPS);
 
   if (topCandidates.length === 0) {
     return [];
   }
 
-  const enriched = await enrichShopsWithPlaceDetails(topCandidates);
-  const rankingMetadata = new Map(
-    topCandidates.map((candidate) => [candidate.place_id, candidate] as const)
+  const preparedCandidates = topCandidates.map((candidate) =>
+    createInvestigationCandidate(candidate)
   );
-  const enrichedSeeds: CandidateSeed[] = enriched.map((candidate) => {
-    const rankedCandidate = rankingMetadata.get(candidate.place_id);
+  const enriched = await enrichShopsWithPlaceDetails(preparedCandidates, diagnostics);
+  const reranked = rankCandidateSeeds(enriched, context, true);
+  const rerankedMap = new Map(reranked.map((candidate) => [candidate.place_id, candidate] as const));
 
-    return {
-      name: candidate.name,
-      address: candidate.address,
-      place_id: candidate.place_id,
-      website: candidate.website,
-      lat: candidate.lat,
-      lng: candidate.lng,
-      rating: candidate.rating,
-      types: candidate.types,
-      matchedProfileIds: rankedCandidate?.matchedProfileIds ?? [],
-      preferredMatch: rankedCandidate?.preferredMatch ?? false,
-      keywordMatch: rankedCandidate?.keywordMatch ?? false,
-    };
-  });
-
-  return rankCandidateSeeds(enrichedSeeds, context, true);
+  return enriched
+    .map((candidate) => {
+      const rerankedCandidate = rerankedMap.get(candidate.place_id);
+      return {
+        ...candidate,
+        rank: rerankedCandidate?.rank ?? candidate.rank,
+        scoutScore: rerankedCandidate?.scoutScore ?? candidate.scoutScore,
+        distanceMeters: rerankedCandidate?.distanceMeters ?? candidate.distanceMeters,
+        providerFailures: [...candidate.providerFailures],
+        types: candidate.types ? [...candidate.types] : undefined,
+        matchedProfileIds: [...candidate.matchedProfileIds],
+      };
+    })
+    .sort((left, right) => left.rank - right.rank);
 }
 
-function getInvestigationCategory(shop: AgentShop): InvestigationCategory {
-  if (isBeautySalonLike(shop)) return "beauty";
-  if (isCinemaOrTicketedVenue(shop)) return "movie";
-  if (isKaraokeOrAmusementShop(shop)) return "karaoke";
-  if (isFoodOrCafeShop(shop)) return "food";
-  if (isRetailOrStudyShop(shop)) {
-    const types = shop.types ?? [];
-    if (types.includes("book_store")) return "book";
-    if (types.includes("clothing_store")) return "fashion";
-    return "book";
-  }
-  if (isFitnessOrActivityShop(shop)) return "fitness";
-  return "generic";
+function getInvestigationCategory(
+  shop: AgentShop
+): StudentDiscountCategoryId | "generic" {
+  return getPrimaryCategoryMatch(shop)?.category.id ?? "generic";
 }
 
-function buildEvidenceSearchQueries(shop: AgentShop, userKeyword?: string): string[] {
+export function buildEvidenceSearchQueries(
+  shop: AgentShop,
+  userKeyword?: string
+): string[] {
   const addressHint =
     typeof shop.address === "string" && shop.address.trim().length > 0
       ? ` ${shop.address.trim().slice(0, 40)}`
       : "";
   const host = getWebsiteHost(shop.website);
-  const categoryTerms =
-    CATEGORY_SPECIFIC_TERMS[getInvestigationCategory(shop)] ??
-    CATEGORY_SPECIFIC_TERMS.generic;
+  const categoryMatch = getPrimaryCategoryMatch(shop);
+  const categoryTerms = categoryMatch?.category.evidenceTerms ?? [];
+  const matchedAliases = categoryMatch?.matchedAliases ?? [];
   const genericTerms = GENERIC_STUDENT_EVIDENCE_KEYWORDS.slice(0, 6);
   const highPriorityTerms = Array.from(
-    new Set([...categoryTerms, ...genericTerms])
+    new Set([...matchedAliases, ...categoryTerms, ...genericTerms])
   ).slice(0, 6);
   const optionalUserKeyword = userKeyword?.trim();
   const queries = [
@@ -1578,52 +2147,18 @@ function buildEvidenceSearchQueries(shop: AgentShop, userKeyword?: string): stri
     }`.trim(),
   ].filter((query): query is string => Boolean(query));
 
-  return queries.filter((query, index, list) => list.indexOf(query) === index).slice(0, 3);
+  return queries
+    .filter((query, index, list) => list.indexOf(query) === index)
+    .slice(0, MAX_EVIDENCE_QUERIES);
 }
 
 async function braveSearchResults(query: string): Promise<BraveSearchResult[]> {
-  try {
-    const apiKey = getBraveSearchApiKey();
-    if (!apiKey) {
-      console.warn(
-        `[Agent][Retriever] Brave Search API key is missing: query="${query}"`
-      );
-      return [];
-    }
-
-    const params = new URLSearchParams({
-      q: query,
-      count: String(MAX_SEARCH_RESULTS_PER_QUERY),
-      country: "JP",
-      search_lang: "ja",
-      extra_snippets: "true",
-    });
-    const response = await fetch(
-      `${getBraveSearchApiUrl()}?${params.toString()}`,
-      {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          "Accept-Encoding": "gzip",
-          "X-Subscription-Token": apiKey,
-        },
-        signal: AbortSignal.timeout(15_000),
-      }
-    );
-
-    if (!response.ok) {
-      console.warn(
-        `[Agent][Retriever] web_search failed (${response.status}): query="${query}"`
-      );
-      return [];
-    }
-
-    const data = (await response.json()) as BraveSearchResponse;
-    return normalizeBraveSearchResults(data).slice(0, MAX_SEARCH_RESULTS_PER_QUERY);
-  } catch (error) {
-    console.error("[Agent][Retriever] web_search error:", error);
+  const response = await executeBraveSearchRequest(query, MAX_SEARCH_RESULTS_PER_QUERY);
+  if (!response.ok) {
+    console.error("[Agent][Retriever] web_search error:", response.message);
     return [];
   }
+  return response.results;
 }
 
 function formatEvidenceSnippets(snippets: EvidenceSnippet[]): string {
@@ -1644,21 +2179,98 @@ function formatEvidenceSnippets(snippets: EvidenceSnippet[]): string {
 
 async function collectEvidenceBundle(
   shop: AgentShop,
-  userKeyword?: string
-): Promise<EvidenceBundle> {
+  userKeyword?: string,
+  diagnostics?: SearchRunDiagnostics
+): Promise<{
+  evidence: EvidenceBundle;
+  haltedAt?: CandidateHaltStage;
+  haltReason?: CandidateHaltReason;
+  providerFailures: ProviderFailure[];
+}> {
   const queries = buildEvidenceSearchQueries(shop, userKeyword);
-  const queryResults = await Promise.all(
-    queries.map(async (query) => ({
-      query,
-      results: await braveSearchResults(query),
-    }))
-  );
-
   const snippets: EvidenceSnippet[] = [];
   const seenSnippetKeys = new Set<string>();
   const sourceUrls: string[] = [];
+  const providerFailures: ProviderFailure[] = [];
+  const braveDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "brave") : null;
 
-  for (const { query, results } of queryResults) {
+  for (let queryIndex = 0; queryIndex < queries.length; queryIndex += 1) {
+    const query = queries[queryIndex];
+    let results: BraveSearchResult[] = [];
+    let requestFailed = false;
+
+    for (let attempt = 1; attempt <= BRAVE_MAX_ATTEMPTS; attempt += 1) {
+      braveDiagnostics && (braveDiagnostics.attempted += 1);
+      const response = await executeBraveSearchRequest(query, MAX_SEARCH_RESULTS_PER_QUERY);
+      if (response.ok) {
+        braveDiagnostics && (braveDiagnostics.succeeded += 1);
+        logApiEvent("log", {
+          stage: "retriever",
+          provider: "brave",
+          action: "continue",
+          shop: shop.name,
+          placeId: shop.place_id,
+          query,
+          httpStatus: response.status,
+          attempt,
+          durationMs: response.durationMs,
+          retryable: false,
+        });
+        results = response.results;
+        break;
+      }
+
+      braveDiagnostics && (braveDiagnostics.failed += 1);
+      const failure: ProviderFailure = {
+        provider: "brave",
+        stage: "retriever",
+        reason: response.status ? `http_${response.status}` : "request_failed",
+        message: response.message,
+        httpStatus: response.status,
+        query,
+        retryable: response.retryable,
+        attempt,
+        bodyPreview: response.bodyPreview,
+      };
+      const shouldRetry = response.retryable && attempt < BRAVE_MAX_ATTEMPTS;
+      logApiEvent(shouldRetry ? "warn" : "error", {
+        stage: "retriever",
+        provider: "brave",
+        action: shouldRetry ? "retry" : "abort_candidate",
+        shop: shop.name,
+        placeId: shop.place_id,
+        query,
+        httpStatus: response.status,
+        attempt,
+        durationMs: response.durationMs,
+        retryable: response.retryable,
+        bodyPreview: response.bodyPreview,
+        message: response.message,
+      });
+      if (shouldRetry) {
+        continue;
+      }
+
+      providerFailures.push(failure);
+      const skippedQueries = queries.length - queryIndex - 1;
+      braveDiagnostics && (braveDiagnostics.skipped += skippedQueries);
+      requestFailed = true;
+      break;
+    }
+
+    if (requestFailed) {
+      return {
+        evidence: createEmptyEvidenceBundle(
+          shop,
+          queries,
+          "Search failed before evidence could be collected."
+        ),
+        haltedAt: "retriever",
+        haltReason: "brave_request_failed",
+        providerFailures,
+      };
+    }
+
     for (const result of results) {
       const snippetKey = `${result.url}::${result.title}`;
       if (seenSnippetKeys.has(snippetKey)) {
@@ -1677,13 +2289,26 @@ async function collectEvidenceBundle(
     }
   }
 
-  return {
+  const evidence: EvidenceBundle = {
     shop,
     retriever: "Retriever",
     queries,
     snippets: snippets.slice(0, MAX_EVIDENCE_SNIPPETS),
     sourceUrls,
     summary: formatEvidenceSnippets(snippets),
+  };
+  if (evidence.snippets.length === 0) {
+    return {
+      evidence,
+      haltedAt: "retriever",
+      haltReason: "brave_no_evidence",
+      providerFailures,
+    };
+  }
+
+  return {
+    evidence,
+    providerFailures,
   };
 }
 
@@ -1692,6 +2317,7 @@ function buildVerifierMessage(
   evidence: EvidenceBundle,
   userKeyword?: string
 ): string {
+  const categoryExamples = getCategoryPromptExamples(shop);
   const lines = [
     "Team role: Verifier",
     `Store: ${shop.name}`,
@@ -1714,6 +2340,12 @@ function buildVerifierMessage(
     "If the evidence does not explicitly support a student discount, return has_gakuwari=false."
   );
   lines.push(
+    "Student discounts include student pricing, student plans, student memberships, student tickets, student menus, U24 offers, student-ID benefits, and student-only coupons."
+  );
+  if (categoryExamples.length > 0) {
+    lines.push(`Category examples: ${categoryExamples.join(", ")}`);
+  }
+  lines.push(
     "Treat 学生カット, 学割U24, U24, 学生限定クーポン, 高校生料金, and 大学生料金 as valid student discounts."
   );
   lines.push("Return JSON only.");
@@ -1727,6 +2359,7 @@ function buildReviewerMessage(
   current: AgentResultItem,
   userKeyword?: string
 ): string {
+  const categoryExamples = getCategoryPromptExamples(shop);
   const lines = [
     "Team role: Reviewer",
     `Store: ${shop.name}`,
@@ -1756,6 +2389,12 @@ function buildReviewerMessage(
   lines.push(
     "If evidence is still insufficient, keep has_gakuwari=false and use low or medium confidence."
   );
+  lines.push(
+    "Student discounts include student pricing, student plans, student memberships, student tickets, student menus, U24 offers, student-ID benefits, and student-only coupons."
+  );
+  if (categoryExamples.length > 0) {
+    lines.push(`Category examples: ${categoryExamples.join(", ")}`);
+  }
   lines.push("Return JSON only.");
 
   return lines.join("\n");
@@ -1780,8 +2419,11 @@ async function runVerifier(
   evidence: EvidenceBundle,
   userKeyword?: string,
   llmProvider: LLMProviderMode = "gemini"
-): Promise<AgentResultItem> {
-  const content = await callLLMForAgent(
+): Promise<{
+  result: AgentResultItem;
+  usage?: GeminiChatCompletionResponse["usage"];
+}> {
+  const invocation = await callLLMForAgentDetailed(
     [
       { role: "system", content: SYSTEM_PROMPT },
       {
@@ -1792,7 +2434,10 @@ async function runVerifier(
     llmProvider
   );
 
-  return normalizeResultWithEvidence(parseAgentResult(shop, content), evidence);
+  return {
+    result: normalizeResultWithEvidence(parseAgentResult(shop, invocation.content), evidence),
+    usage: invocation.usage,
+  };
 }
 
 async function runReviewer(
@@ -1801,8 +2446,11 @@ async function runReviewer(
   current: AgentResultItem,
   userKeyword?: string,
   llmProvider: LLMProviderMode = "gemini"
-): Promise<AgentResultItem> {
-  const content = await callLLMForAgent(
+): Promise<{
+  result: AgentResultItem;
+  usage?: GeminiChatCompletionResponse["usage"];
+}> {
+  const invocation = await callLLMForAgentDetailed(
     [
       { role: "system", content: REVIEW_SYSTEM_PROMPT },
       {
@@ -1813,15 +2461,29 @@ async function runReviewer(
     llmProvider
   );
 
-  return normalizeResultWithEvidence(parseAgentResult(shop, content), evidence);
+  return {
+    result: normalizeResultWithEvidence(parseAgentResult(shop, invocation.content), evidence),
+    usage: invocation.usage,
+  };
+}
+
+function hasPositiveReviewerSignal(evidence: EvidenceBundle): boolean {
+  return evidence.snippets.some((snippet) =>
+    matchesAnyPattern(
+      `${snippet.title}\n${snippet.content}\n${snippet.url}`,
+      STUDENT_POSITIVE_PATTERNS
+    )
+  );
 }
 
 function shouldReviewOutcome(outcome: InvestigationOutcome): boolean {
   return (
+    outcome.verifierCompleted &&
     !outcome.result.has_gakuwari &&
     outcome.result.confidence === "low" &&
     outcome.rank <= 4 &&
-    outcome.evidence.snippets.length > 0
+    outcome.evidence.snippets.length > 0 &&
+    hasPositiveReviewerSignal(outcome.evidence)
   );
 }
 
@@ -1844,16 +2506,21 @@ async function applyReviewerPass(
   outcomes: InvestigationOutcome[],
   userKeyword?: string,
   forcedPlaceIds: string[] = [],
-  llmProvider: LLMProviderMode = "gemini"
+  llmProvider: LLMProviderMode = "gemini",
+  diagnostics?: SearchRunDiagnostics
 ): Promise<InvestigationOutcome[]> {
   const forcedSet = new Set(forcedPlaceIds);
-  const targets = outcomes.filter(
-    (outcome) =>
-      !outcome.reviewed &&
-      !outcome.result.has_gakuwari &&
-      outcome.evidence.snippets.length > 0 &&
-      (shouldReviewOutcome(outcome) || forcedSet.has(outcome.shop.place_id))
-  );
+  const targets = outcomes
+  .filter(
+      (outcome) =>
+        !outcome.reviewed &&
+        outcome.verifierCompleted &&
+        !outcome.result.has_gakuwari &&
+        outcome.evidence.snippets.length > 0 &&
+        (shouldReviewOutcome(outcome) || forcedSet.has(outcome.shop.place_id))
+    )
+    .sort((left, right) => left.rank - right.rank)
+    .slice(0, MAX_REVIEW_TARGETS);
 
   if (targets.length === 0) {
     return outcomes;
@@ -1861,6 +2528,9 @@ async function applyReviewerPass(
 
   const reviewed = await Promise.all(
     targets.map(async (outcome) => {
+      const geminiDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "gemini") : null;
+      const startedAt = performance.now();
+      geminiDiagnostics && (geminiDiagnostics.attempted += 1);
       try {
         const reviewedResult = await runReviewer(
           outcome.shop,
@@ -1869,11 +2539,37 @@ async function applyReviewerPass(
           userKeyword,
           llmProvider
         );
+        geminiDiagnostics && (geminiDiagnostics.succeeded += 1);
+        logApiEvent("log", {
+          stage: "reviewer",
+          provider: "gemini",
+          action: "continue",
+          shop: outcome.shop.name,
+          placeId: outcome.shop.place_id,
+          attempt: 1,
+          durationMs: Math.round(performance.now() - startedAt),
+          retryable: false,
+          prompt_tokens: reviewedResult.usage?.prompt_tokens,
+          completion_tokens: reviewedResult.usage?.completion_tokens,
+          total_tokens: reviewedResult.usage?.total_tokens,
+        });
         return {
           placeId: outcome.shop.place_id,
-          result: mergeReviewedResult(outcome.result, reviewedResult),
+          result: mergeReviewedResult(outcome.result, reviewedResult.result),
         };
       } catch (error) {
+        geminiDiagnostics && (geminiDiagnostics.failed += 1);
+        logApiEvent("error", {
+          stage: "reviewer",
+          provider: "gemini",
+          action: "continue",
+          shop: outcome.shop.name,
+          placeId: outcome.shop.place_id,
+          attempt: 1,
+          durationMs: Math.round(performance.now() - startedAt),
+          retryable: false,
+          message: error instanceof Error ? error.message : "Unknown reviewer error",
+        });
         console.warn(
           `[Agent][Reviewer] Failed to review "${outcome.shop.name}"`,
           error
@@ -1903,15 +2599,17 @@ async function applyReviewerPass(
       result: reviewedResult,
       reviewed: true,
       reviewerTriggered: true,
+      verifierCompleted: outcome.verifierCompleted,
       reviewer: "Reviewer",
     };
   });
 }
 
 async function investigateRankedCandidate(
-  candidate: RankedCandidate,
+  candidate: InvestigationCandidate,
   userKeyword?: string,
-  llmProvider: LLMProviderMode = "gemini"
+  llmProvider: LLMProviderMode = "gemini",
+  diagnostics?: SearchRunDiagnostics
 ): Promise<InvestigationOutcome> {
   const startedAt = performance.now();
   const cacheKey = getAgentCacheKey(
@@ -1927,6 +2625,8 @@ async function investigateRankedCandidate(
       verifier: "Verifier",
       reviewed: false,
       reviewerTriggered: false,
+      verifierCompleted: false,
+      providerFailures: [...candidate.providerFailures],
       evidence: {
         shop: candidate,
         retriever: "Retriever",
@@ -1939,22 +2639,149 @@ async function investigateRankedCandidate(
     };
   }
 
+  const queries = buildEvidenceSearchQueries(candidate, userKeyword);
+  if (candidate.haltedAt && candidate.haltReason) {
+    const braveDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "brave") : null;
+    const geminiDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "gemini") : null;
+    braveDiagnostics && (braveDiagnostics.skipped += queries.length);
+    geminiDiagnostics && (geminiDiagnostics.skipped += 1);
+    logCandidateHalt(
+      candidate,
+      candidate.haltedAt,
+      candidate.haltReason,
+      ["brave_retriever", "gemini_verifier", "gemini_reviewer"],
+      candidate.providerFailures
+    );
+    return {
+      shop: candidate,
+      rank: candidate.rank,
+      verifier: "Verifier",
+      reviewed: false,
+      reviewerTriggered: false,
+      verifierCompleted: false,
+      haltedAt: candidate.haltedAt,
+      haltReason: candidate.haltReason,
+      providerFailures: [...candidate.providerFailures],
+      evidence: createEmptyEvidenceBundle(
+        candidate,
+        queries,
+        "Candidate halted before evidence collection due to missing investigation context."
+      ),
+      result: createDefaultResult(candidate),
+    };
+  }
+
+  let evidenceResult: Awaited<ReturnType<typeof collectEvidenceBundle>>;
+  let evidenceMs = 0;
   try {
     const evidenceStartedAt = performance.now();
-    const evidence = await collectEvidenceBundle(candidate, userKeyword);
-    const evidenceMs = Math.round(performance.now() - evidenceStartedAt);
-    const verifierStartedAt = performance.now();
-    const result = await runVerifier(
+    evidenceResult = await collectEvidenceBundle(candidate, userKeyword, diagnostics);
+    evidenceMs = Math.round(performance.now() - evidenceStartedAt);
+  } catch (error) {
+    const braveDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "brave") : null;
+    braveDiagnostics && (braveDiagnostics.failed += 1);
+    const failure: ProviderFailure = {
+      provider: "brave",
+      stage: "retriever",
+      reason: "retriever_failed",
+      message: error instanceof Error ? error.message : "Unknown retriever error",
+      retryable: false,
+    };
+    const providerFailures = [...candidate.providerFailures, failure];
+    const geminiDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "gemini") : null;
+    geminiDiagnostics && (geminiDiagnostics.skipped += 1);
+    logApiEvent("error", {
+      stage: "retriever",
+      provider: "brave",
+      action: "abort_candidate",
+      shop: candidate.name,
+      placeId: candidate.place_id,
+      attempt: 1,
+      durationMs: Math.round(performance.now() - startedAt),
+      retryable: false,
+      message: failure.message,
+    });
+    logCandidateHalt(
       candidate,
-      evidence,
+      "retriever",
+      "brave_request_failed",
+      ["gemini_verifier", "gemini_reviewer"],
+      providerFailures
+    );
+    return {
+      shop: candidate,
+      rank: candidate.rank,
+      verifier: "Verifier",
+      reviewed: false,
+      reviewerTriggered: false,
+      verifierCompleted: false,
+      haltedAt: "retriever",
+      haltReason: "brave_request_failed",
+      providerFailures,
+      evidence: createEmptyEvidenceBundle(
+        candidate,
+        queries,
+        "Search failed before evidence could be collected."
+      ),
+      result: createDefaultResult(candidate),
+    };
+  }
+
+  const providerFailures = [...candidate.providerFailures, ...evidenceResult.providerFailures];
+  if (evidenceResult.haltedAt && evidenceResult.haltReason) {
+    const geminiDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "gemini") : null;
+    geminiDiagnostics && (geminiDiagnostics.skipped += 1);
+    logCandidateHalt(
+      candidate,
+      evidenceResult.haltedAt,
+      evidenceResult.haltReason,
+      ["gemini_verifier", "gemini_reviewer"],
+      providerFailures
+    );
+    return {
+      shop: candidate,
+      rank: candidate.rank,
+      verifier: "Verifier",
+      reviewed: false,
+      reviewerTriggered: false,
+      verifierCompleted: false,
+      haltedAt: evidenceResult.haltedAt,
+      haltReason: evidenceResult.haltReason,
+      providerFailures,
+      evidence: evidenceResult.evidence,
+      result: createDefaultResult(candidate),
+    };
+  }
+
+  const geminiDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "gemini") : null;
+  geminiDiagnostics && (geminiDiagnostics.attempted += 1);
+  try {
+    const verifierStartedAt = performance.now();
+    const verifierResult = await runVerifier(
+      candidate,
+      evidenceResult.evidence,
       userKeyword,
       llmProvider
     );
     const verifierMs = Math.round(performance.now() - verifierStartedAt);
-    cacheAgentResult(cacheKey, result);
+    geminiDiagnostics && (geminiDiagnostics.succeeded += 1);
+    logApiEvent("log", {
+      stage: "verifier",
+      provider: "gemini",
+      action: "continue",
+      shop: candidate.name,
+      placeId: candidate.place_id,
+      attempt: 1,
+      durationMs: verifierMs,
+      retryable: false,
+      prompt_tokens: verifierResult.usage?.prompt_tokens,
+      completion_tokens: verifierResult.usage?.completion_tokens,
+      total_tokens: verifierResult.usage?.total_tokens,
+    });
+    cacheAgentResult(cacheKey, verifierResult.result);
 
     console.log(
-      `[Agent][Verifier][${llmProvider}] Shop="${candidate.name}" rank=${candidate.rank} queries=${evidence.queries.length} snippets=${evidence.snippets.length} evidenceMs=${evidenceMs} verifierMs=${verifierMs} totalMs=${Math.round(
+      `[Agent][Verifier][${llmProvider}] Shop="${candidate.name}" rank=${candidate.rank} queries=${evidenceResult.evidence.queries.length} snippets=${evidenceResult.evidence.snippets.length} evidenceMs=${evidenceMs} verifierMs=${verifierMs} totalMs=${Math.round(
         performance.now() - startedAt
       )}`
     );
@@ -1965,13 +2792,42 @@ async function investigateRankedCandidate(
       verifier: "Verifier",
       reviewed: false,
       reviewerTriggered: false,
-      evidence,
-      result,
+      verifierCompleted: true,
+      providerFailures,
+      evidence: evidenceResult.evidence,
+      result: verifierResult.result,
     };
   } catch (error) {
+    geminiDiagnostics && (geminiDiagnostics.failed += 1);
+    const failure: ProviderFailure = {
+      provider: "gemini",
+      stage: "verifier",
+      reason: "verifier_failed",
+      message: error instanceof Error ? error.message : "Unknown verifier error",
+      retryable: false,
+    };
+    const haltedFailures = [...providerFailures, failure];
+    logApiEvent("error", {
+      stage: "verifier",
+      provider: "gemini",
+      action: "abort_candidate",
+      shop: candidate.name,
+      placeId: candidate.place_id,
+      attempt: 1,
+      durationMs: Math.round(performance.now() - startedAt),
+      retryable: false,
+      message: failure.message,
+    });
     console.error(
       `[Agent][Verifier][${llmProvider}] Shop="${candidate.name}" failed:`,
       error
+    );
+    logCandidateHalt(
+      candidate,
+      "verifier",
+      "gemini_failed",
+      ["gemini_reviewer"],
+      haltedFailures
     );
     return {
       shop: candidate,
@@ -1979,23 +2835,21 @@ async function investigateRankedCandidate(
       verifier: "Verifier",
       reviewed: false,
       reviewerTriggered: false,
-      evidence: {
-        shop: candidate,
-        retriever: "Retriever",
-        queries: buildEvidenceSearchQueries(candidate, userKeyword),
-        snippets: [],
-        sourceUrls: [],
-        summary: "Search failed before evidence could be collected.",
-      },
+      verifierCompleted: false,
+      haltedAt: "verifier",
+      haltReason: "gemini_failed",
+      providerFailures: haltedFailures,
+      evidence: evidenceResult.evidence,
       result: createDefaultResult(candidate),
     };
   }
 }
 
 async function investigateCandidates(
-  candidates: RankedCandidate[],
+  candidates: InvestigationCandidate[],
   userKeyword?: string,
-  llmProvider: LLMProviderMode = "gemini"
+  llmProvider: LLMProviderMode = "gemini",
+  diagnostics?: SearchRunDiagnostics
 ): Promise<InvestigationOutcome[]> {
   const outcomes: InvestigationOutcome[] = [];
 
@@ -2007,7 +2861,7 @@ async function investigateCandidates(
     const batch = candidates.slice(index, index + INVESTIGATION_BATCH_SIZE);
     const batchOutcomes = await Promise.all(
       batch.map((candidate) =>
-        investigateRankedCandidate(candidate, userKeyword, llmProvider)
+        investigateRankedCandidate(candidate, userKeyword, llmProvider, diagnostics)
       )
     );
     outcomes.push(...batchOutcomes);
@@ -2059,16 +2913,35 @@ function toGakuwariSearchResult(
   };
 }
 
-async function enrichShopsWithPlaceDetails(
-  shops: AgentShop[]
-): Promise<AgentShop[]> {
+async function enrichShopsWithPlaceDetails<T extends AgentShop>(
+  shops: T[],
+  diagnostics?: SearchRunDiagnostics
+): Promise<T[]> {
   if (shops.length === 0) {
     return shops;
   }
 
   const enrichedShops = await Promise.all(
     shops.map(async (shop) => {
+      const detailsDiagnostics = diagnostics ? getStepDiagnostics(diagnostics, "details") : null;
+      if (!shouldLookupPlaceDetails(shop)) {
+        detailsDiagnostics && (detailsDiagnostics.skipped += 1);
+        return shop;
+      }
+
+      const cachedDetails = getCachedPlaceDetails(shop.place_id);
+      if (cachedDetails) {
+        detailsDiagnostics && (detailsDiagnostics.skipped += 1);
+        return {
+          ...shop,
+          address: cachedDetails.address || shop.address,
+          website: cachedDetails.website ?? shop.website,
+        } as T;
+      }
+
       console.log(`[Agent][Places] details lookup for "${shop.name}"`);
+      detailsDiagnostics && (detailsDiagnostics.attempted += 1);
+      const startedAt = performance.now();
 
       try {
         const details = await makeRequest<PlaceDetailsResult>(
@@ -2079,22 +2952,84 @@ async function enrichShopsWithPlaceDetails(
             language: "ja",
           }
         );
+        const durationMs = Math.round(performance.now() - startedAt);
 
         if (details.status !== "OK" || !details.result) {
-          return shop;
+          detailsDiagnostics && (detailsDiagnostics.failed += 1);
+          const failure: ProviderFailure = {
+            provider: "details",
+            stage: "details",
+            reason: "details_status",
+            message: `Place details returned ${details.status}`,
+            providerStatus: details.status,
+            retryable: false,
+          };
+          const usableContext = hasUsableInvestigationContext(shop);
+          logApiEvent(usableContext ? "warn" : "error", {
+            stage: "details",
+            provider: "details",
+            action: usableContext ? "continue" : "abort_candidate",
+            shop: shop.name,
+            placeId: shop.place_id,
+            providerStatus: details.status,
+            durationMs,
+            retryable: false,
+            message: failure.message,
+          });
+          return usableContext
+            ? appendProviderFailure(shop, failure)
+            : haltPreparedCandidate(shop, "details_unusable_context", failure);
         }
 
-        return {
+        detailsDiagnostics && (detailsDiagnostics.succeeded += 1);
+        const enrichedShop = {
           ...shop,
           address: details.result.formatted_address ?? shop.address,
           website: details.result.website ?? shop.website,
         };
+        logApiEvent("log", {
+          stage: "details",
+          provider: "details",
+          action: "continue",
+          shop: shop.name,
+          placeId: shop.place_id,
+          providerStatus: details.status,
+          durationMs,
+          retryable: false,
+        });
+        cachePlaceDetails(shop.place_id, {
+          address: enrichedShop.address,
+          website: enrichedShop.website,
+        });
+        return enrichedShop as T;
       } catch (error) {
+        detailsDiagnostics && (detailsDiagnostics.failed += 1);
+        const durationMs = Math.round(performance.now() - startedAt);
+        const failure: ProviderFailure = {
+          provider: "details",
+          stage: "details",
+          reason: "details_request_failed",
+          message: error instanceof Error ? error.message : "Unknown place details error",
+          retryable: false,
+        };
+        const usableContext = hasUsableInvestigationContext(shop);
+        logApiEvent(usableContext ? "warn" : "error", {
+          stage: "details",
+          provider: "details",
+          action: usableContext ? "continue" : "abort_candidate",
+          shop: shop.name,
+          placeId: shop.place_id,
+          durationMs,
+          retryable: false,
+          message: failure.message,
+        });
         console.warn(
           `[Agent][Places] details lookup failed for "${shop.name}"`,
           error
         );
-        return shop;
+        return usableContext
+          ? appendProviderFailure(shop, failure)
+          : haltPreparedCandidate(shop, "details_unusable_context", failure);
       }
     })
   );
@@ -2173,15 +3108,30 @@ export async function searchGakuwariSpots(
   llmProvider: LLMProviderMode = "gemini"
 ): Promise<GakuwariSearchResult[]> {
   const startedAt = performance.now();
+  const diagnostics = createSearchRunDiagnostics();
   const rankedCandidates = await prepareCandidatesForInvestigation(
     lat,
     lng,
     radius,
-    keyword
+    keyword,
+    diagnostics
   );
+  diagnostics.candidatesPrepared = rankedCandidates.length;
 
   if (rankedCandidates.length === 0) {
     console.log("[Agent][Scout] No candidate shops found within the radius");
+    logAgentEvent("log", {
+      event: "search_summary",
+      profiles: diagnostics.profiles,
+      candidatesPrepared: diagnostics.candidatesPrepared,
+      candidatesInvestigated: 0,
+      candidatesHalted: 0,
+      nearby: diagnostics.nearby,
+      details: diagnostics.details,
+      brave: diagnostics.brave,
+      gemini: diagnostics.gemini,
+      totalMs: Math.round(performance.now() - startedAt),
+    });
     return [];
   }
 
@@ -2193,21 +3143,10 @@ export async function searchGakuwariSpots(
   let outcomes = await investigateCandidates(
     waveOneCandidates,
     keyword,
-    llmProvider
+    llmProvider,
+    diagnostics
   );
-  outcomes = await applyReviewerPass(outcomes, keyword, [], llmProvider);
-
-  if (!outcomes.some((outcome) => outcome.result.has_gakuwari)) {
-    const forcedReviewerIds = outcomes
-      .slice(0, 3)
-      .map((outcome) => outcome.shop.place_id);
-    outcomes = await applyReviewerPass(
-      outcomes,
-      keyword,
-      forcedReviewerIds,
-      llmProvider
-    );
-  }
+  outcomes = await applyReviewerPass(outcomes, keyword, [], llmProvider, diagnostics);
 
   if (outcomes.some((outcome) => outcome.result.has_gakuwari)) {
     const additionalCandidates = rankedCandidates.slice(
@@ -2219,10 +3158,11 @@ export async function searchGakuwariSpots(
       const extraOutcomes = await investigateCandidates(
         additionalCandidates,
         keyword,
-        llmProvider
+        llmProvider,
+        diagnostics
       );
       outcomes = outcomes.concat(
-        await applyReviewerPass(extraOutcomes, keyword, [], llmProvider)
+        await applyReviewerPass(extraOutcomes, keyword, [], llmProvider, diagnostics)
       );
     }
   } else {
@@ -2235,21 +3175,41 @@ export async function searchGakuwariSpots(
       const waveTwoOutcomes = await investigateCandidates(
         waveTwoCandidates,
         keyword,
-        llmProvider
+        llmProvider,
+        diagnostics
       );
       outcomes = outcomes.concat(
-        await applyReviewerPass(waveTwoOutcomes, keyword, [], llmProvider)
+        await applyReviewerPass(waveTwoOutcomes, keyword, [], llmProvider, diagnostics)
       );
     }
   }
 
   const sortedOutcomes = sortInvestigationOutcomes(outcomes);
+  diagnostics.candidatesInvestigated = sortedOutcomes.length;
+  diagnostics.candidatesHalted = sortedOutcomes.filter((outcome) => Boolean(outcome.haltedAt)).length;
 
   console.log(
     `[Agent][Timing][${llmProvider}] searchGakuwariSpots candidates=${rankedCandidates.length} investigated=${sortedOutcomes.length} totalMs=${Math.round(
       performance.now() - startedAt
     )}`
   );
+  logAgentEvent("log", {
+    event: "search_summary",
+    profiles: diagnostics.profiles,
+    matchedCategoryIds: diagnostics.matchedCategoryIds,
+    matchedAliases: diagnostics.matchedAliases,
+    apiBoostEnabled: diagnostics.apiBoostEnabled,
+    budgetPolicy: diagnostics.budgetPolicy,
+    broadOnlyReason: diagnostics.broadOnlyReason,
+    candidatesPrepared: diagnostics.candidatesPrepared,
+    candidatesInvestigated: diagnostics.candidatesInvestigated,
+    candidatesHalted: diagnostics.candidatesHalted,
+    nearby: diagnostics.nearby,
+    details: diagnostics.details,
+    brave: diagnostics.brave,
+    gemini: diagnostics.gemini,
+    totalMs: Math.round(performance.now() - startedAt),
+  });
 
   return sortedOutcomes.map((outcome) =>
     toGakuwariSearchResult(outcome.shop, outcome.result)

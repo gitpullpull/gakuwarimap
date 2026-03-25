@@ -1,12 +1,29 @@
-import { useState, useMemo } from "react";
-import { useLocation, useSearch } from "wouter";
+import { useMemo, useState } from "react";
+import { useSearch } from "wouter";
 import { trpc } from "@/lib/trpc";
+import {
+  buildSpotBrowseQueryInput,
+  isSpotSortBy,
+  SPOT_SORT_OPTIONS,
+  type SpotSortBy,
+} from "@/lib/spotSort";
 import { SpotCard } from "@/components/SpotCard";
 import { CategoryIcon, getCategoryBgColor } from "@/components/CategoryIcon";
 import { Button } from "@/components/ui/button";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { MapPin, SlidersHorizontal, ChevronLeft, ChevronRight } from "lucide-react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  MapPin,
+  SlidersHorizontal,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const PAGE_SIZE = 12;
@@ -17,20 +34,22 @@ export default function SpotList() {
   const initialCategory = params.get("category");
 
   const [categoryId, setCategoryId] = useState<number | undefined>(
-    initialCategory ? parseInt(initialCategory) : undefined
+    initialCategory ? parseInt(initialCategory, 10) : undefined
   );
-  const [sortBy, setSortBy] = useState<"newest" | "rating" | "name">("newest");
+  const [sortBy, setSortBy] = useState<SpotSortBy>("newest");
   const [page, setPage] = useState(0);
 
   const { data: categoriesData } = trpc.category.list.useQuery();
   const categories = categoriesData ?? [];
 
-  const { data, isLoading } = trpc.spot.list.useQuery({
-    categoryId,
-    sortBy,
-    limit: PAGE_SIZE,
-    offset: page * PAGE_SIZE,
-  });
+  const { data, isLoading } = trpc.spot.list.useQuery(
+    buildSpotBrowseQueryInput({
+      categoryId,
+      sortBy,
+      page,
+      pageSize: PAGE_SIZE,
+    })
+  );
 
   const spots = data?.items ?? [];
   const total = data?.total ?? 0;
@@ -38,84 +57,103 @@ export default function SpotList() {
 
   const categoryMap = useMemo(() => {
     const map = new Map<number, (typeof categories)[0]>();
-    categories.forEach((c) => map.set(c.id, c));
+    categories.forEach((category) => map.set(category.id, category));
     return map;
   }, [categories]);
 
   return (
     <div className="min-h-screen pb-20 md:pb-8">
       <div className="container py-6">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6">
-          <h1 className="text-2xl sm:text-3xl font-black uppercase tracking-tight">
+        <div className="mb-6 flex items-center justify-between">
+          <h1 className="text-2xl font-black uppercase tracking-tight sm:text-3xl">
             学割スポット一覧
           </h1>
-          <span className="text-sm text-muted-foreground font-semibold">
+          <span className="text-sm font-semibold text-muted-foreground">
             {total}件
           </span>
         </div>
 
-        {/* Filters */}
-        <div className="flex flex-col sm:flex-row gap-3 mb-6">
-          {/* Category filter */}
-          <div className="flex gap-2 overflow-x-auto pb-2 -mx-4 px-4 sm:mx-0 sm:px-0 sm:flex-wrap scrollbar-hide">
+        <div className="mb-6 flex flex-col gap-3 sm:flex-row">
+          <div className="scrollbar-hide -mx-4 flex gap-2 overflow-x-auto px-4 pb-2 sm:mx-0 sm:flex-wrap sm:px-0">
             <button
-              onClick={() => { setCategoryId(undefined); setPage(0); }}
+              onClick={() => {
+                setCategoryId(undefined);
+                setPage(0);
+              }}
               className={cn(
-                "flex items-center gap-1.5 px-3 py-1.5 rounded-full border-2 border-foreground text-xs font-bold shrink-0 transition-all",
+                "flex shrink-0 items-center gap-1.5 rounded-full border-2 border-foreground px-3 py-1.5 text-xs font-bold transition-all",
                 "shadow-[2px_2px_0px_oklch(0.15_0.01_0)]",
-                !categoryId ? "bg-primary text-primary-foreground" : "bg-card hover:bg-muted"
+                !categoryId
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-card hover:bg-muted"
               )}
             >
               すべて
             </button>
-            {categories.map((cat) => (
+            {categories.map((category) => (
               <button
-                key={cat.id}
-                onClick={() => { setCategoryId(cat.id); setPage(0); }}
+                key={category.id}
+                onClick={() => {
+                  setCategoryId(category.id);
+                  setPage(0);
+                }}
                 className={cn(
-                  "flex items-center gap-1.5 px-3 py-1.5 rounded-full border-2 border-foreground text-xs font-bold shrink-0 transition-all",
+                  "flex shrink-0 items-center gap-1.5 rounded-full border-2 border-foreground px-3 py-1.5 text-xs font-bold transition-all",
                   "shadow-[2px_2px_0px_oklch(0.15_0.01_0)]",
-                  categoryId === cat.id ? "bg-primary text-primary-foreground" : cn("bg-card hover:bg-muted", getCategoryBgColor(cat.color))
+                  categoryId === category.id
+                    ? "bg-primary text-primary-foreground"
+                    : cn(
+                        "bg-card hover:bg-muted",
+                        getCategoryBgColor(category.color)
+                      )
                 )}
               >
-                <CategoryIcon icon={cat.icon} size={14} />
-                {cat.name}
+                <CategoryIcon icon={category.icon} size={14} />
+                {category.name}
               </button>
             ))}
           </div>
 
-          {/* Sort */}
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex shrink-0 items-center gap-2">
             <SlidersHorizontal size={16} className="text-muted-foreground" />
-            <Select value={sortBy} onValueChange={(v) => { setSortBy(v as any); setPage(0); }}>
-              <SelectTrigger className="w-[140px] h-9 border-2 border-foreground rounded-lg text-xs font-bold shadow-[2px_2px_0px_oklch(0.15_0.01_0)]">
+            <Select
+              value={sortBy}
+              onValueChange={(value) => {
+                if (!isSpotSortBy(value)) return;
+                setSortBy(value);
+                setPage(0);
+              }}
+            >
+              <SelectTrigger className="h-9 w-[170px] rounded-lg border-2 border-foreground text-xs font-bold shadow-[2px_2px_0px_oklch(0.15_0.01_0)]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="newest">新着順</SelectItem>
-                <SelectItem value="rating">評価順</SelectItem>
-                <SelectItem value="name">名前順</SelectItem>
+                {SPOT_SORT_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>
         </div>
 
-        {/* Grid */}
         {isLoading ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <Skeleton key={i} className="h-64 rounded-xl" />
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {Array.from({ length: 6 }).map((_, index) => (
+              <Skeleton key={index} className="h-64 rounded-xl" />
             ))}
           </div>
         ) : spots.length === 0 ? (
-          <div className="text-center py-16 bg-card rounded-xl border-2 border-foreground shadow-[4px_4px_0px_oklch(0.15_0.01_0)]">
-            <MapPin size={48} className="mx-auto text-muted-foreground/30 mb-3" />
-            <p className="text-muted-foreground font-medium">該当するスポットが見つかりません</p>
+          <div className="rounded-xl border-2 border-foreground bg-card py-16 text-center shadow-[4px_4px_0px_oklch(0.15_0.01_0)]">
+            <MapPin size={48} className="mx-auto mb-3 text-muted-foreground/30" />
+            <p className="font-medium text-muted-foreground">
+              条件に合うスポットが見つかりません
+            </p>
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {spots.map((spot) => (
                 <SpotCard
                   key={spot.id}
@@ -125,9 +163,8 @@ export default function SpotList() {
               ))}
             </div>
 
-            {/* Pagination */}
             {totalPages > 1 && (
-              <div className="flex items-center justify-center gap-2 mt-8">
+              <div className="mt-8 flex items-center justify-center gap-2">
                 <Button
                   variant="outline"
                   size="sm"
@@ -137,7 +174,7 @@ export default function SpotList() {
                 >
                   <ChevronLeft size={16} />
                 </Button>
-                <span className="text-sm font-bold px-3">
+                <span className="px-3 text-sm font-bold">
                   {page + 1} / {totalPages}
                 </span>
                 <Button

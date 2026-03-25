@@ -62,7 +62,7 @@ export const appRouter = router({
         search: z.string().optional(),
         limit: z.number().min(1).max(100).optional(),
         offset: z.number().min(0).optional(),
-        sortBy: z.enum(["rating", "newest", "name"]).optional(),
+        sortBy: z.enum(["rating", "newest", "name", "discountRate"]).optional(),
       }).optional())
       .query(async ({ input }) => {
         return getSpots(input ?? {});
