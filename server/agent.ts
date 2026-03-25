@@ -128,8 +128,12 @@ const SYSTEM_PROMPT = [
   "  - 常設展無料 (free permanent exhibitions) for students or under-18 visitors.",
   "Return a JSON object only with these keys:",
   '{"has_gakuwari":true,"discount_info":"string","source_url":"string","confidence":"high|medium|low"}',
-  "Use an empty string when discount details or source_url are unavailable.",
-  "confidence should be high only when the discount is explicitly confirmed by a reliable source.",
+  "Rules for discount_info:",
+  "  - When has_gakuwari=true: discount_info MUST be a non-empty summary of the discount",
+  "    (e.g., '学生200円（一般400円）', '大学生以下無料', '学生証提示で20%OFF').",
+  "  - When has_gakuwari=false: use empty string for discount_info.",
+  "Use empty string for source_url when unavailable.",
+  "confidence should be \"high\" only when the discount is explicitly confirmed by a reliable source.",
 ].join("\n");
 
 const DEFAULT_PARSED_RESULT: ParsedAgentResult = {
@@ -654,6 +658,9 @@ function buildEvidenceReviewMessage(
     lines.push(
       "If the evidence mentions 常設展無料 or free admission for students, set has_gakuwari=true."
     );
+    lines.push(
+      "When has_gakuwari=true, set discount_info to the actual admission prices from evidence, e.g. '学生200円（一般400円）' or '高校生以下無料'. Never leave discount_info empty when has_gakuwari=true."
+    );
   } else {
     lines.push(
       "If the evidence does not explicitly support a student discount, return has_gakuwari=false."
@@ -700,7 +707,9 @@ async function runAgentForShop(
     );
 
     const llmMs = Math.round(performance.now() - llmStartedAt);
+    console.log(`[Agent][LLM] "${shop.name}" evidence=${evidenceMs}ms llm=${llmMs}ms raw=${JSON.stringify(content.slice(0, 300))}`);
     const parsed = parseAgentResult(shop, content);
+    console.log(`[Agent][Result] "${shop.name}" has_gakuwari=${parsed.has_gakuwari} confidence=${parsed.confidence} discount_info=${JSON.stringify(parsed.discount_info)}`);
     cacheAgentResult(parsed);
     console.log(
       `[Agent][Timing][${llmProvider}] Shop="${shop.name}" evidenceMs=${evidenceMs} llmMs=${llmMs} totalMs=${Math.round(
