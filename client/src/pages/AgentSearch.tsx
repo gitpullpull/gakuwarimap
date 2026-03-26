@@ -363,7 +363,7 @@ export default function AgentSearch() {
                 <Input
                   value={keyword}
                   onChange={(event) => setKeyword(event.target.value)}
-                  placeholder="キーワード任意: カフェ、ラーメン、カラオケ..."
+                  placeholder="キーワード任意: カラオケ、美術館、ラーメン..."
                   className="h-11 rounded-lg border-2 border-foreground/20 pl-9"
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
